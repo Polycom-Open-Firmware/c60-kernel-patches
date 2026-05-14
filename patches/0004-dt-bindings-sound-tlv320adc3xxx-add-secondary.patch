@@ -1,0 +1,85 @@
+From 0f266ea7051f6e594a15d5a4cd9722a80e6b2e78 Mon Sep 17 00:00:00 2001
+From: acamilo <Alex.Camilo@gmail.com>
+Date: Wed, 13 May 2026 18:51:56 -0400
+Subject: [PATCH 4/4] ASoC: dt-bindings: tlv320adc3xxx: document -secondary
+ compatibles
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the new "ti,tlv320adc3001-secondary" and "ti,tlv320adc3101-secondary"
+compatibles to the binding. These describe the same silicon used as one
+of N codecs sharing a single TDM bus, where the chip is a clock consumer
+rather than the bus master.
+
+A description block calls out the intended use (audio-graph-card2
+multi-codec endpoint shape with per-codec dai-tdm-slot-rx-mask), and an
+allOf/if conditional makes the "clocks" property optional only for the
+-secondary variants — the bus-master codec may share MCLK with the
+secondaries from a single supply on the board, in which case the
+secondary's "clocks" entry can be a reference to the same provider or
+omitted entirely. reset-gpios was already optional schema-wise and
+remains so.
+---
+ .../bindings/sound/ti,tlv320adc3xxx.yaml      | 32 +++++++++++++++++--
+ 1 file changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
+index ede14ca2c..4097f805e 100644
+--- a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
++++ b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
+@@ -14,14 +14,22 @@ description: |
+   https://www.ti.com/product/TLV320ADC3001
+   https://www.ti.com/product/TLV320ADC3101
+ 
+-allOf:
+-  - $ref: dai-common.yaml#
++  The "-secondary" compatible variants describe the same silicon used as
++  one of N codecs sharing a single TDM bus. A secondary codec acts as a
++  clock consumer (BCLK and FSYNC are driven by the bus-master codec or
++  the host SAI), so reset-gpios and clocks become optional — the
++  bus-master codec's reset propagates and MCLK may be shared from the
++  primary's clock supply. Use the -secondary compatibles in conjunction
++  with the audio-graph-card2 multi-codec endpoint shape and per-codec
++  dai-tdm-slot-rx-mask to place each chip on its own TDM slot pair.
+ 
+ properties:
+   compatible:
+     enum:
+       - ti,tlv320adc3001
+       - ti,tlv320adc3101
++      - ti,tlv320adc3001-secondary
++      - ti,tlv320adc3101-secondary
+ 
+   reg:
+     maxItems: 1
+@@ -107,7 +115,25 @@ properties:
+ required:
+   - compatible
+   - reg
+-  - clocks
++
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            enum:
++              - ti,tlv320adc3001
++              - ti,tlv320adc3101
++      not:
++        properties:
++          compatible:
++            contains:
++              enum:
++                - ti,tlv320adc3001-secondary
++                - ti,tlv320adc3101-secondary
++    then:
++      required:
++        - clocks
+ 
+ unevaluatedProperties: false
+ 
+-- 
+2.34.1
+

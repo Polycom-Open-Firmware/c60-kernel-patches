@@ -1,0 +1,241 @@
+From 465be038e60fae1df590a2016797529cf19a639e Mon Sep 17 00:00:00 2001
+From: acamilo <Alex.Camilo@gmail.com>
+Date: Wed, 13 May 2026 18:49:47 -0400
+Subject: [PATCH 3/4] ASoC: tlv320adc3xxx: add -secondary compatible for
+ clock-consumer mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+When the codec is part of a multi-codec TDM topology (e.g. three
+TLV320ADC3101 mic codecs sharing one SAI on the Poly Trio C60), exactly
+one chip drives BCLK/WCLK and the others are clock consumers. The
+existing single compatible per chip always treats the part as a
+bus-master candidate and requires a mandatory reset-gpios + pulses it
+at probe — incompatible with chips that share a reset rail with the
+bus master.
+
+Add two new compatibles:
+
+  ti,tlv320adc3001-secondary
+  ti,tlv320adc3101-secondary
+
+Both bind to the same driver as their non-suffixed counterparts (chip
+programming is identical) but carry a per-match is_secondary flag via
+a new struct adc3xxx_match_data attached to each of_device_id entry.
+
+When is_secondary is set:
+
+  - reset-gpios becomes optional (devm_gpiod_get_optional with
+    GPIOD_ASIS). The line is refcounted but never driven by this
+    driver — the bus-master chip's reset (or a board-level shared
+    reset) handles deassert.
+
+  - the reset pulse (set 1, sleep, set 0) is skipped at probe.
+
+  - set_dai_fmt overrides any DT-requested clock-provider mode to
+    SND_SOC_DAIFMT_CBC_CFC (codec consumes both BCLK and FSYNC), with
+    a dev_warn so a misconfigured DT is visible in dmesg.
+
+  - hw_params skips the BCLK_N_DIV write — the chip is a bit-clock
+    consumer and the divider has no effect on bus timing.
+
+MCLK is still acquired and refcounted; the i.MX 8M Mini routes one
+SAI MCLK to all three codecs on the C60 and the clk subsystem
+shares it. The non-suffixed compatibles continue to behave exactly
+as before (is_secondary = false), so this is a strictly additive
+change for existing users.
+---
+ sound/soc/codecs/tlv320adc3xxx.c | 125 +++++++++++++++++++++++++++----
+ 1 file changed, 111 insertions(+), 14 deletions(-)
+
+diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
+index 53c063138..bceceb272 100644
+--- a/sound/soc/codecs/tlv320adc3xxx.c
++++ b/sound/soc/codecs/tlv320adc3xxx.c
+@@ -313,6 +313,20 @@ enum adc3xxx_type {
+ 	ADC3101
+ };
+ 
++/*
++ * Match data for the device tree compatible strings. The "-secondary"
++ * variants share the chip programming of their non-suffixed counterpart
++ * but mark the codec as a clock consumer for multi-codec TDM topologies:
++ * reset-gpios is optional, the reset pulse is skipped (the bus-master chip
++ * or a board-level reset is expected to bring the part out of POR), the
++ * codec refuses to enter clock-master mode in .set_fmt, and hw_params
++ * skips writing BCLK_N_DIV (the chip is the bit-clock consumer).
++ */
++struct adc3xxx_match_data {
++	enum adc3xxx_type type;
++	bool is_secondary;
++};
++
+ struct adc3xxx {
+ 	struct device *dev;
+ 	enum adc3xxx_type type;
+@@ -331,6 +345,10 @@ struct adc3xxx {
+ 	 */
+ 	unsigned int tdm_first_slot;
+ 	unsigned int tdm_slot_width;
++	/* When set, this chip is one of N codecs sharing a TDM bus and acts
++	 * as a clock consumer rather than the bus master.
++	 */
++	bool is_secondary;
+ 	struct gpio_chip gpio_chip;
+ };
+ 
+@@ -1209,11 +1227,20 @@ static int adc3xxx_hw_params(struct snd_pcm_substream *substream,
+ 	/* AOSR */
+ 	snd_soc_component_update_bits(component, ADC3XXX_ADC_AOSR,
+ 				      ADC3XXX_AOSR_MASK, adc3xxx_divs[i].aosr);
+-	/* BDIV N Value */
+-	/* BCLK is (by default) set up to be derived from ADC_CLK */
+-	bdiv = (adc3xxx_divs[i].aosr * adc3xxx_divs[i].madc) / (2 * width);
+-	snd_soc_component_update_bits(component, ADC3XXX_BCLK_N_DIV,
+-				      ADC3XXX_BDIV_MASK, bdiv);
++	/*
++	 * BDIV N Value
++	 * BCLK is (by default) set up to be derived from ADC_CLK.
++	 *
++	 * Skip on -secondary compatibles: the chip is a bit-clock consumer
++	 * in a multi-codec TDM topology, and BCLK is driven externally (by
++	 * the bus-master codec or the SAI). Writing the divider would have
++	 * no effect on bus timing but would burn cycles in regmap.
++	 */
++	if (!adc3xxx->is_secondary) {
++		bdiv = (adc3xxx_divs[i].aosr * adc3xxx_divs[i].madc) / (2 * width);
++		snd_soc_component_update_bits(component, ADC3XXX_BCLK_N_DIV,
++					      ADC3XXX_BDIV_MASK, bdiv);
++	}
+ 
+ 	/*
+ 	 * Program TDM slot offset for this chip's capture pair. By default
+@@ -1349,6 +1376,20 @@ static int adc3xxx_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
+ 	int master = 0;
+ 	int ret;
+ 
++	/*
++	 * -secondary compatibles must run as clock consumers — they share a
++	 * TDM bus with a primary that drives BCLK/WCLK. Override any DT
++	 * request that would put them into a clock-provider mode, but warn
++	 * since this is almost certainly a DT bug.
++	 */
++	if (adc3xxx->is_secondary &&
++	    (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) != SND_SOC_DAIFMT_CBC_CFC) {
++		dev_warn(component->dev,
++			 "secondary codec asked to be clock provider; forcing CBC_CFC\n");
++		fmt = (fmt & ~SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) |
++		      SND_SOC_DAIFMT_CBC_CFC;
++	}
++
+ 	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+ 	case SND_SOC_DAIFMT_CBP_CFP:
+ 		master = 1;
+@@ -1446,6 +1487,7 @@ static int adc3xxx_i2c_probe(struct i2c_client *i2c)
+ {
+ 	struct device *dev = &i2c->dev;
+ 	struct adc3xxx *adc3xxx = NULL;
++	const struct adc3xxx_match_data *match;
+ 	const struct i2c_device_id *id;
+ 	int ret;
+ 
+@@ -1454,7 +1496,29 @@ static int adc3xxx_i2c_probe(struct i2c_client *i2c)
+ 		return -ENOMEM;
+ 	adc3xxx->dev = dev;
+ 
+-	adc3xxx->rst_pin = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	/*
++	 * Pick up the chip type and the secondary flag. of_device_get_match_data()
++	 * returns NULL when bound via i2c_device_id (no DT), in which case we
++	 * fall back to the chip type from the i2c id table and is_secondary=false.
++	 */
++	match = of_device_get_match_data(dev);
++	if (match) {
++		adc3xxx->type = match->type;
++		adc3xxx->is_secondary = match->is_secondary;
++	}
++
++	/*
++	 * -secondary variants share a reset line with the bus-master chip
++	 * (or rely on POR), so reset-gpios is optional. When present we
++	 * acquire with GPIOD_ASIS to refcount the line without driving it,
++	 * and skip the reset pulse — the master's reset propagates.
++	 */
++	if (adc3xxx->is_secondary) {
++		adc3xxx->rst_pin = devm_gpiod_get_optional(dev, "reset",
++							   GPIOD_ASIS);
++	} else {
++		adc3xxx->rst_pin = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	}
+ 	if (IS_ERR(adc3xxx->rst_pin)) {
+ 		return dev_err_probe(dev, PTR_ERR(adc3xxx->rst_pin),
+ 				     "Failed to request rst_pin\n");
+@@ -1499,13 +1563,20 @@ static int adc3xxx_i2c_probe(struct i2c_client *i2c)
+ 
+ 	i2c_set_clientdata(i2c, adc3xxx);
+ 
+-	id = i2c_match_id(adc3xxx_i2c_id, i2c);
+-	adc3xxx->type = id->driver_data;
++	if (!match) {
++		id = i2c_match_id(adc3xxx_i2c_id, i2c);
++		adc3xxx->type = id->driver_data;
++	}
+ 
+-	/* Reset codec chip */
+-	gpiod_set_value_cansleep(adc3xxx->rst_pin, 1);
+-	usleep_range(2000, 100000); /* Requirement: > 10 ns (datasheet p13) */
+-	gpiod_set_value_cansleep(adc3xxx->rst_pin, 0);
++	/*
++	 * Reset codec chip. Skip on -secondary: the bus-master chip's reset
++	 * (or a board-level shared reset line) brings this part out of POR.
++	 */
++	if (!adc3xxx->is_secondary) {
++		gpiod_set_value_cansleep(adc3xxx->rst_pin, 1);
++		usleep_range(2000, 100000); /* Requirement: > 10 ns (datasheet p13) */
++		gpiod_set_value_cansleep(adc3xxx->rst_pin, 0);
++	}
+ 
+ 	/* Potentially set up pins used as GPIOs */
+ 	adc3xxx_init_gpio(adc3xxx);
+@@ -1534,9 +1605,35 @@ static void __exit adc3xxx_i2c_remove(struct i2c_client *client)
+ 	snd_soc_unregister_component(&client->dev);
+ }
+ 
++static const struct adc3xxx_match_data adc3001_data = {
++	.type = ADC3001,
++	.is_secondary = false,
++};
++
++static const struct adc3xxx_match_data adc3101_data = {
++	.type = ADC3101,
++	.is_secondary = false,
++};
++
++static const struct adc3xxx_match_data adc3001_secondary_data = {
++	.type = ADC3001,
++	.is_secondary = true,
++};
++
++static const struct adc3xxx_match_data adc3101_secondary_data = {
++	.type = ADC3101,
++	.is_secondary = true,
++};
++
+ static const struct of_device_id tlv320adc3xxx_of_match[] = {
+-	{ .compatible = "ti,tlv320adc3001", },
+-	{ .compatible = "ti,tlv320adc3101", },
++	{ .compatible = "ti,tlv320adc3001",
++	  .data = &adc3001_data, },
++	{ .compatible = "ti,tlv320adc3101",
++	  .data = &adc3101_data, },
++	{ .compatible = "ti,tlv320adc3001-secondary",
++	  .data = &adc3001_secondary_data, },
++	{ .compatible = "ti,tlv320adc3101-secondary",
++	  .data = &adc3101_secondary_data, },
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, tlv320adc3xxx_of_match);
+-- 
+2.34.1
+

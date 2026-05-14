@@ -1,0 +1,633 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: Alex Camilo <alex.camilo@gmail.com>
+Date: Wed, 13 May 2026 16:00:00 -0400
+Subject: [PATCH] arm64: dts: freescale: add imx8mm-kepler-proto1 board support
+
+Add a device tree for the Poly Trio C60 ("Kepler proto1") conference
+phone, an i.MX 8M Mini Quad design. Sister to imx8mm-tc8.dts; reuses
+the same RTL8363NB-VB DSA switch driver, TAS5751M codec, BD71837 PMIC,
+and FEC fixed-PHY conduit work introduced for the TC8.
+
+Currently enabled: console (ttymxc1), eMMC (USDHC3), FEC + RTL DSA
+switch with lan/pc user ports, BD71837 PMIC, audio (TAS5751M on SAI1).
+
+Stubbed (status = "disabled", board chips physically present but
+mainline driver bring-up not yet done): TC358743 HDMI-in bridge,
+ADV7535 HDMI-out, RM67191 DSI panel, Focaltech FTS touch, ADC3101 mic
+codec, LP5569 LEDs, IR receiver, brcmfmac WiFi/BT on PCIe.
+
+Verified booting Debian 12 / 6.6 on a kepler_proto1 unit via Android
+`boota` + AVB orange (testkey signing) — same flash flow as the
+TC8. Slot B Polycom Android remains untouched as recovery.
+
+Signed-off-by: Alex Camilo <alex.camilo@gmail.com>
+---
+ arch/arm64/boot/dts/freescale/Makefile             |   1 +
+ .../boot/dts/freescale/imx8mm-kepler-proto1.dts    | 587 ++++++
+ 2 files changed, 588 insertions(+)
+ create mode 100644 arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
+
+diff --git a/arch/arm64/boot/dts/freescale/Makefile b/arch/arm64/boot/dts/freescale/Makefile
+index 7cae75aa3..7cae75aa3 100644
+--- a/arch/arm64/boot/dts/freescale/Makefile
++++ b/arch/arm64/boot/dts/freescale/Makefile
+@@ -178,3 +178,4 @@ dtb-$(CONFIG_ARCH_MXC) += imx8mp-venice-gw74xx-rpidsi.dtb
+ dtb-$(CONFIG_ARCH_S32) += s32g274a-evb.dtb
+ dtb-$(CONFIG_ARCH_S32) += s32g274a-rdb2.dtb
+ dtb-$(CONFIG_ARCH_S32) += s32v234-evb.dtb
++dtb-$(CONFIG_ARCH_MXC) += imx8mm-kepler-proto1.dtb
+diff --git a/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
+new file mode 100644
+index 000000000..0000000000
+--- /dev/null
++++ b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
+@@ -0,0 +1,587 @@
++// SPDX-License-Identifier: GPL-2.0+
++// Polycom Trio C60 (Kepler proto1) — incremental DT on top of EVK base.
++//
++// Sister board to TC8 (LCC) — see imx8mm-tc8.dts for the analog. Same i.MX
++// 8M Mini SoC, same RTL8363NB-VB switch on FEC1, same TAS5751M amp on SAI1,
++// same BD71837 PMIC, same Vivante GC520L GPU, same Hantro VPU. Differences
++// described inline.
++//
++// Target boot milestone for this initial DT: serial console, eMMC, RTL
++// ethernet, brcmfmac WiFi enumerated. Panel / touch / HDMI-in are TODOs.
++
++/dts-v1/;
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include "imx8mm-evk.dtsi"
++
++/ {
++	model = "Polycom Trio C60 (Kepler proto1)";
++	compatible = "poly,kepler-proto1", "fsl,imx8mm-evk", "fsl,imx8mm";
++
++	chosen {
++		bootargs = "";
++		stdout-path = &uart2;
++	};
++
++	memory@40000000 {
++		device_type = "memory";
++		/* C60 has 2 GiB, not the EVK's 4 GiB.  Override the EVK reg. */
++		reg = <0x0 0x40000000 0 0x80000000>;
++	};
++
++	/* WLAN_EN regulator: stock sd1_regulator drives gpio2/19 HI to power
++	 * the brcmfmac SDIO card. Used as vmmc-supply for USDHC1. */
++	reg_wlan: regulator-wlan {
++		compatible = "regulator-fixed";
++		regulator-name = "WLAN_EN";
++		gpio = <&gpio2 19 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		startup-delay-us = <100>;
++		off-on-delay-us = <20000>;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++
++	/* TC358743 HDMI-RX bridge needs explicit 3v3 + 1v2 supplies. Stock
++	 * drives them out of GPIO3_IO19 / GPIO3_IO20.  The mainline tc358743
++	 * binding doesn't consume these directly, so expose them as fixed
++	 * regulators that we just keep "always on" while the bridge is enabled. */
++	reg_hdmi_in_1v2: regulator-hdmi-in-1v2 {
++		compatible = "regulator-fixed";
++		regulator-name = "TC358743_1V2";
++		gpio = <&gpio3 19 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-min-microvolt = <1200000>;
++		regulator-max-microvolt = <1200000>;
++		regulator-always-on;
++	};
++
++	reg_hdmi_in_3v3: regulator-hdmi-in-3v3 {
++		compatible = "regulator-fixed";
++		regulator-name = "TC358743_3V3";
++		gpio = <&gpio3 20 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++	};
++
++	/* Fixed 27 MHz oscillator feeding the TC358743 refclk. Stock named it
++	 * "hdmi-osc" — keep that name for grep-ability. */
++	osc_hdmi: hdmi-osc {
++		compatible = "fixed-clock";
++		#clock-cells = <0>;
++		clock-frequency = <27000000>;
++		clock-output-names = "hdmi-osc";
++	};
++
++	/* Override EVK gpio-keys: C60 only has the external-mic mute button. */
++	gpio-keys {
++		compatible = "gpio-keys";
++		/delete-node/ volume-up;
++		/delete-node/ volume-down;
++		/delete-node/ power;
++
++		extmic_mute {
++			label = "EXT Mic Mute";
++			linux,code = <248>;   /* KEY_MICMUTE */
++			gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
++			debounce-interval = <100>;
++			pinctrl-names = "default";
++			pinctrl-0 = <&pinctrl_micmute>;
++		};
++	};
++};
++
++/* --------------------------------------------------------------------- */
++/* PMIC: C60 is bd71837 like TC8 (not the EVK's bd71847). Same regulator
++ * overrides as TC8. */
++&i2c1 {
++	pmic@4b {
++		compatible = "rohm,bd71837";
++
++		regulators {
++			BUCK4 {
++				regulator-name = "buck4";
++				regulator-min-microvolt = <700000>;
++				regulator-max-microvolt = <1300000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++			BUCK5 {
++				regulator-name = "buck5";
++				regulator-min-microvolt = <700000>;
++				regulator-max-microvolt = <1350000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++			BUCK6 {
++				regulator-name = "buck6";
++				regulator-min-microvolt = <3000000>;
++				regulator-max-microvolt = <3300000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++			BUCK7 {
++				regulator-name = "buck7";
++				regulator-min-microvolt = <1605000>;
++				regulator-max-microvolt = <1995000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++			BUCK8 {
++				regulator-name = "buck8";
++				regulator-min-microvolt = <800000>;
++				regulator-max-microvolt = <1400000>;
++				regulator-boot-on;
++				regulator-always-on;
++			};
++		};
++	};
++};
++
++/* --------------------------------------------------------------------- */
++/* I2C2 = mainline node on 30a30000.
++ *
++ * C60: FT touchscreen @ 0x38, kepler_cap @ 0x37 (vendor MCU, no mainline
++ * driver — leave disabled), LP5569 @ 0x32 (chip not populated per probe).
++ *
++ * EVK base puts adv7535+ptn5110 here — disable those.
++ */
++&i2c2 {
++	clock-frequency = <400000>;	/* stock C60 = 0x61a80 = 400 kHz */
++	status = "okay";
++
++	/* Disable EVK-inherited HDMI bridge */
++	hdmi@3d { status = "disabled"; };
++
++	/* TODO: FT touchscreen. Stock binding is the out-of-tree
++	 * "focaltech,fts" with focaltech,panel-type = <0x73110002>. Mainline
++	 * edt-ft5x06 may bind if the underlying silicon is FT5x06-class.
++	 * Leave disabled until the panel is up. */
++	touchscreen@38 {
++		compatible = "edt,edt-ft5x06";
++		reg = <0x38>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_focaltech>;
++		interrupt-parent = <&gpio1>;
++		interrupts = <14 IRQ_TYPE_EDGE_FALLING>;
++		reset-gpios = <&gpio2 3 GPIO_ACTIVE_LOW>;
++		touchscreen-size-x = <720>;
++		touchscreen-size-y = <1280>;
++		status = "disabled";
++	};
++
++	/* kepler_cap @ 0x37 — vendor LED-ring MCU. No mainline driver.  Stock
++	 * probe also fails ("Write Init failed") so chip likely depopulated. */
++	/* (intentionally omitted) */
++
++	/* LP5569 @ 0x32 — stock probe returns -ENXIO; chip not populated.
++	 * Add when a populated rev shows up. */
++	/* (intentionally omitted) */
++};
++
++/* --------------------------------------------------------------------- */
++/* I2C3 = mainline node on 30a40000.
++ *
++ * C60: TAS5751M @ 0x2b (mic amp), TLV320ADC3101 @ 0x1b (primary mic ADC) +
++ * two extra inactive ADC3101 at 0x18 and 0x19 (audio expansion), kepler_cap
++ * @ 0x37 (vendor MCU), LP5569 @ 0x32 (not populated).
++ */
++&i2c3 {
++	clock-frequency = <100000>;	/* stock = 0x186a0 = 100 kHz */
++	status = "okay";
++
++	tas5751: audio-codec@2b {
++		compatible = "ti,tas5751m";
++		reg = <0x2b>;
++		#sound-dai-cells = <0>;
++		clocks = <&clk IMX8MM_CLK_SAI1_ROOT>;
++		clock-names = "mclk";
++		reset-gpios = <&gpio3 25 GPIO_ACTIVE_HIGH>;
++		pdn-gpios = <&gpio4 22 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_tas5751>;
++		status = "okay";
++	};
++
++	/* Primary mic ADC. Compatibility with mainline TBD — stock vendor
++	 * driver is "ti,tlv320adc3101_kepler"; mainline binding (post-5.x) is
++	 * "ti,tlv320adc3101". If the recent ADC3xxx driver isn't in 6.6,
++	 * carry the stock vendor driver as a kernel patch. */
++	mic_adc0: audio-codec@1b {
++		compatible = "ti,tlv320adc3101";
++		reg = <0x1b>;
++		reset-gpios = <&gpio1 12 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_mic_adc>;
++		status = "disabled";  /* enable once driver landed */
++	};
++
++	mic_adc1: audio-codec@18 {
++		compatible = "ti,tlv320adc3101";
++		reg = <0x18>;
++		status = "disabled";
++	};
++
++	mic_adc2: audio-codec@19 {
++		compatible = "ti,tlv320adc3101";
++		reg = <0x19>;
++		status = "disabled";
++	};
++};
++
++/* --------------------------------------------------------------------- */
++/* I2C4 = mainline node on 30a50000.
++ *
++ * C60: TC358743 HDMI-RX @ 0x0f, TCA6408 GPIO-exp @ 0x20, kepler_cap @ 0x37
++ * (skip), LP5569 @ 0x32 (skip).
++ *
++ * EVK doesn't expose i2c4 — declare it here from scratch.
++ */
++&i2c4 {
++	clock-frequency = <100000>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&pinctrl_i2c4>;
++	status = "okay";
++
++	/* TCA6408A 8-bit GPIO expander. Stock has it as ti,tca6408; mainline
++	 * uses pca953x driver with ti,tca6408a. */
++	tca6408: gpio@20 {
++		compatible = "ti,tca6408";
++		reg = <0x20>;
++		gpio-controller;
++		#gpio-cells = <2>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_pse>;
++		reset-gpios = <&gpio2 9 GPIO_ACTIVE_LOW>;
++		status = "okay";
++	};
++
++	/* HDMI input bridge. Mainline driver is well-supported. */
++	hdmi_in: hdmi-bridge@0f {
++		compatible = "toshiba,tc358743";
++		reg = <0x0f>;
++		clocks = <&osc_hdmi>;
++		clock-names = "refclk";
++		reset-gpios = <&gpio1 6 GPIO_ACTIVE_LOW>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_tc358743>;
++		status = "okay";
++
++		port@0 {
++			reg = <0>;
++			tc358743_to_mipi_csi: endpoint {
++				clock-lanes = <0>;
++				data-lanes = <1 2 3 4>;
++				link-frequencies = /bits/ 64 <297000000>;
++				remote-endpoint = <&mipi_csi_from_tc358743>;
++				clock-noncontinuous;
++			};
++		};
++	};
++};
++
++/* MIPI-CSI in: stock wires tc358743 → mipi_csi@32e30000. EVK leaves CSI
++ * disabled — turn it on for our HDMI capture path. */
++&mipi_csi {
++	status = "okay";
++
++	port@1 {
++		reg = <1>;
++		mipi_csi_from_tc358743: endpoint {
++			data-lanes = <1 2 3 4>;
++			remote-endpoint = <&tc358743_to_mipi_csi>;
++		};
++	};
++};
++
++/* --------------------------------------------------------------------- */
++/* FEC1 + Realtek DSA switch.
++ *
++ * Same chip as TC8 (RTL8363NB-VB at MDIO addr 0x1d — see re/STATUS.md for
++ * the "stock said 0x1e but vendor driver hardcodes 0x1d" caveat).
++ *
++ * Differences vs TC8 mainline:
++ *   - reset-gpios: C60 uses GPIO1_IO11, TC8 uses GPIO5_IO02
++ *   - third user port "pc" at switch port 3 (daisy-chain through-port, not
++ *     present on TC8)
++ *
++ * Note: depends on tc8-kernel-patches/0003 (RTL DSA) + 0004 (FEC fixed-link).
++ */
++&fec1 {
++	/delete-property/ phy-handle;
++
++	mdio {
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		switch@1d {
++			compatible = "realtek,rtl8365mb";
++			reg = <0x1d>;
++			reset-gpios = <&gpio1 11 GPIO_ACTIVE_LOW>;
++
++			ports {
++				#address-cells = <1>;
++				#size-cells = <0>;
++
++				port@1 {
++					reg = <1>;
++					label = "lan";
++				};
++
++				/* C60-specific: daisy-chain PC pass-through port */
++				port@3 {
++					reg = <3>;
++					label = "pc";
++				};
++
++				port@6 {
++					reg = <6>;
++					label = "cpu";
++					ethernet = <&fec1>;
++					phy-mode = "rgmii-id";
++					fixed-link {
++						speed = <1000>;
++						full-duplex;
++					};
++				};
++			};
++		};
++	};
++};
++
++/* --------------------------------------------------------------------- */
++/* eMMC: USDHC3 (8-bit, non-removable). Same wiring as TC8 — reuse the same
++ * pin programming. */
++&usdhc3 {
++	pinctrl-names = "default", "state_100mhz", "state_200mhz";
++	pinctrl-0 = <&pinctrl_usdhc3>;
++	pinctrl-1 = <&pinctrl_usdhc3_100mhz>;
++	pinctrl-2 = <&pinctrl_usdhc3_200mhz>;
++	bus-width = <8>;
++	non-removable;
++	status = "okay";
++};
++
++/* USDHC2: C60 stock leaves this off (SD slot only on tabletop EVK). Keep
++ * it disabled. */
++&usdhc2 { status = "disabled"; };
++/* reg_usdhc2_vmmc label is not defined in mainline imx8mm.dtsi (it's
++ * usually a board-level regulator); usdhc2 itself disabled above is
++ * sufficient. */
++
++/* USDHC1: C60 has brcmfmac WiFi on SDIO here. 4-bit, non-removable. */
++&usdhc1 {
++	pinctrl-names = "default", "state_100mhz", "state_200mhz";
++	pinctrl-0 = <&pinctrl_usdhc1>;
++	pinctrl-1 = <&pinctrl_usdhc1_100mhz>;
++	pinctrl-2 = <&pinctrl_usdhc1_200mhz>;
++	bus-width = <4>;
++	non-removable;
++	vmmc-supply = <&reg_wlan>;
++	status = "okay";
++
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	brcmf: wifi@1 {
++		reg = <1>;
++		/* TODO: confirm exact chip via PROBE_NOTES once the SDIO bus
++		 * is up — stock says cypress/brcm but no exact P/N. Start
++		 * with the generic bcm4329-fmac fallback. */
++		compatible = "brcm,bcm4329-fmac";
++	};
++};
++
++/* --------------------------------------------------------------------- */
++/* MIPI-DSI panel — Raydium RM67191 (C60-specific; mainline already has
++ * the driver).
++ *
++ * Stock proto1 fails to probe (vendor ID returns 0x00). Try once on
++ * mainline; if it still fails, fall back to HDMI-in.
++ */
++&mipi_dsi {
++	status = "okay";
++
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	panel@0 {
++		compatible = "raydium,rm67191";
++		reg = <0>;
++		reset-gpio = <&gpio2 5 GPIO_ACTIVE_LOW>;
++		dsi-lanes = <4>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_mipi_dsi_en>;
++		/* power-supply / backlight wiring TODO once panel actually
++		 * answers DSI commands */
++		status = "disabled";  /* enable when bring-up is ready */
++	};
++};
++
++&lcdif {
++	status = "okay";
++};
++
++/* No HDMI-out on C60 proto1 — bridge depopulated (u-boot can't find ADV7535). */
++
++/* --------------------------------------------------------------------- */
++/* IO mux groups carried from stock c60.dts. Pin offset values are
++ * verbatim from the live-tree export — pinctrl-imx will hand them off to
++ * the SoC verbatim. */
++&iomuxc {
++	pinctrl_focaltech: focaltechgrp {
++		fsl,pins = <
++			0xac 0x314 0x000 0x05 0x000 0x1d0
++			0x60 0x2c8 0x000 0x00 0x000 0x19
++		>;
++	};
++
++	pinctrl_micmute: micmutegrp {
++		fsl,pins = <0x1e0 0x448 0x000 0x05 0x000 0x19>;
++	};
++
++	pinctrl_tas5751: tas5751grp {
++		fsl,pins = <
++			0x158 0x3c0 0x000 0x05 0x000 0x19
++			0x1b4 0x41c 0x000 0x05 0x000 0x19
++		>;
++	};
++
++	pinctrl_mic_adc: micadcgrp {
++		fsl,pins = <
++			0x3c 0x2a4 0x000 0x00 0x000 0x19
++			0x58 0x2c0 0x000 0x00 0x000 0x19
++		>;
++	};
++
++	pinctrl_i2c4: i2c4grp {
++		fsl,pins = <
++			0x22c 0x494 0x000 0x00 0x000 0x400001c3
++			0x230 0x498 0x000 0x00 0x000 0x400001c3
++		>;
++	};
++
++	pinctrl_tc358743: tc358743grp {
++		fsl,pins = <
++			0x40 0x2a8 0x000 0x00 0x000 0x19
++			0x140 0x3a8 0x000 0x05 0x000 0x19
++			0x144 0x3ac 0x000 0x05 0x000 0x19
++		>;
++	};
++
++	pinctrl_pse: psegrp {
++		fsl,pins = <0xc4 0x32c 0x000 0x05 0x000 0x16>;
++	};
++
++	pinctrl_mipi_dsi_en: mipidsiengrp {
++		fsl,pins = <
++			0xb0 0x318 0x000 0x05 0x000 0x16
++			0xb4 0x31c 0x000 0x05 0x000 0x16
++		>;
++	};
++
++	pinctrl_wlan: wlangrp {
++		fsl,pins = <0x28 0x290 0x000 0x05 0x000 0x16>;
++	};
++
++	/* USDHC1 (WiFi) pins. Verify against stock usdhc1grp/100mhz/200mhz
++	 * before first flash — these are pulled from stock but partial in
++	 * the live export (the 200 MHz pin list isn't there). */
++	pinctrl_usdhc1: usdhc1grp {
++		fsl,pins = <
++			0xa0 0x308 0x000 0x00 0x000 0x190
++			0xa4 0x30c 0x000 0x00 0x000 0x1d0
++			0xa8 0x310 0x000 0x00 0x000 0x1d0
++			/* TODO: data lines D0-D3 — copy from stock C60 once we have
++			 * the full usdhc1grp pin list, or steal from EVK's
++			 * pinctrl_usdhc1 if pinmux is identical. */
++		>;
++	};
++
++	pinctrl_usdhc1_100mhz: usdhc1grp100mhz {
++		fsl,pins = <
++			0xa0 0x308 0x000 0x00 0x000 0x194
++			0xa4 0x30c 0x000 0x00 0x000 0x1d4
++			0xa8 0x310 0x000 0x00 0x000 0x1d4
++		>;
++	};
++
++	pinctrl_usdhc1_200mhz: usdhc1grp200mhz {
++		fsl,pins = <
++			0xa0 0x308 0x000 0x00 0x000 0x196
++			0xa4 0x30c 0x000 0x00 0x000 0x1d6
++			0xa8 0x310 0x000 0x00 0x000 0x1d6
++		>;
++	};
++
++	pinctrl_usdhc3: usdhc3grp {
++		fsl,pins = <
++			0x138 0x3a0 0 0x12 0 0x190
++			0x13c 0x3a4 0 0x02 0 0x1d0
++			0x11c 0x384 0 0x02 0 0x1d0
++			0x120 0x388 0 0x02 0 0x1d0
++			0x124 0x38c 0 0x02 0 0x1d0
++			0x128 0x390 0 0x02 0 0x1d0
++			0x130 0x398 0 0x02 0 0x1d0
++			0x100 0x368 0 0x02 0 0x1d0
++			0x104 0x36c 0 0x02 0 0x1d0
++			0x108 0x370 0 0x02 0 0x1d0
++			0xfc  0x364 0 0x02 0 0x190
++		>;
++	};
++
++	pinctrl_usdhc3_100mhz: usdhc3grp100mhz {
++		fsl,pins = <
++			0x138 0x3a0 0 0x12 0 0x194
++			0x13c 0x3a4 0 0x02 0 0x1d4
++			0x11c 0x384 0 0x02 0 0x1d4
++			0x120 0x388 0 0x02 0 0x1d4
++			0x124 0x38c 0 0x02 0 0x1d4
++			0x128 0x390 0 0x02 0 0x1d4
++			0x130 0x398 0 0x02 0 0x1d4
++			0x100 0x368 0 0x02 0 0x1d4
++			0x104 0x36c 0 0x02 0 0x1d4
++			0x108 0x370 0 0x02 0 0x1d4
++			0xfc  0x364 0 0x02 0 0x194
++		>;
++	};
++
++	pinctrl_usdhc3_200mhz: usdhc3grp200mhz {
++		fsl,pins = <
++			0x138 0x3a0 0 0x12 0 0x196
++			0x13c 0x3a4 0 0x02 0 0x1d6
++			0x11c 0x384 0 0x02 0 0x1d6
++			0x120 0x388 0 0x02 0 0x1d6
++			0x124 0x38c 0 0x02 0 0x1d6
++			0x128 0x390 0 0x02 0 0x1d6
++			0x130 0x398 0 0x02 0 0x1d6
++			0x100 0x368 0 0x02 0 0x1d6
++			0x104 0x36c 0 0x02 0 0x1d6
++			0x108 0x370 0 0x02 0 0x1d6
++			0xfc  0x364 0 0x02 0 0x196
++		>;
++	};
++};
++
++/* --------------------------------------------------------------------- */
++/* Things still TODO (do not enable in starter DT):
++ *
++ *   - sound-kepler card (TAS5751 + 3x ADC3101 + kepler-audio glue)
++ *   - sound-tchdmiaudio (SAI3 capture path off the TC358743)
++ *   - bt-audio (SAI2, brcm BT SCO link)
++ *   - dect-audio (SAI5) — DECT cordless handset; very probably proprietary
++ *   - micfil (PDM mic array)
++ *   - digipyro IR receiver (no mainline driver — stub or add gpio-ir-receiver)
++ *   - kepler_cap touch-button MCUs (no mainline driver, chips depopulated
++ *     anyway)
++ *   - PCIe block (stock has it but brcmfmac binds on SDIO; probe what's
++ *     actually behind pcie@33800000 once mainline is up)
++ *   - flexspi NOR (mt25qu256aba) — present in stock, role unknown
++ *   - imx_rpmsg / Cortex-M4 — no firmware available to us
++ *
++ * Each is a follow-up bring-up milestone (see M7..M10 in
++ * re/c60_mainline_prep.md).
++ */
+-- 
+2.39.5

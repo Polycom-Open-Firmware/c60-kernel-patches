@@ -1,0 +1,118 @@
+From beee4e42c77fa6eac644948cd8f8eb3e5e7608d7 Mon Sep 17 00:00:00 2001
+From: PolyOpenFirmware <alex.camilo@gmail.com>
+Date: Wed, 1 Jul 2026 17:51:52 +0000
+Subject: [PATCH 9/9] ASoC: tlv320adc3xxx: PLL from BCLK via ti,pll-bclk-input
+
+The driver hardcodes the PLL reference to MCLK (CLKGEN_MUX PLL_CLKIN=MCLK)
+and mandates a "mclk" clock. Some boards (e.g. the Poly Trio C60) route
+only BCLK/WCLK and data to the ADC, with no MCLK pin, so the PLL has no
+input and the converter produces only a DC constant.
+
+Add an optional "ti,pll-bclk-input" property that programs the PLL to run
+off BCLK instead (CLKGEN_MUX = 0x07: PLL_CLKIN=BCLK, CODEC_CLKIN=PLL) and
+a divider entry keyed on the BCLK rate (1.536 MHz = 2 slots x 16 bit x
+48 kHz -> PLL 98.304 MHz -> /NADC/MADC/AOSR = 48 kHz). The "mclk" clock is
+still required but its rate is unused for PLL programming; the machine
+driver announces the actual BCLK rate via set_sysclk().
+
+Signed-off-by: PolyOpenFirmware <alex.camilo@gmail.com>
+---
+ .../bindings/sound/ti,tlv320adc3xxx.yaml      |  9 +++++
+ sound/soc/codecs/tlv320adc3xxx.c              | 35 ++++++++++++++++++-
+ 2 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
+index 4097f805e..085f8bc0c 100644
+--- a/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
++++ b/Documentation/devicetree/bindings/sound/ti,tlv320adc3xxx.yaml
+@@ -112,6 +112,15 @@ properties:
+     description: |
+       Mic bias voltage output on MICBIAS2 pin
+ 
++  ti,pll-bclk-input:
++    type: boolean
++    description: |
++      Feed the on-chip PLL from the bit clock (BCLK) instead of MCLK. Use on
++      boards that route only BCLK/WCLK (and the data lines) to the ADC and
++      provide no MCLK pin. The chip still requires a "clocks"/"clock-names =
++      mclk" entry, but its rate is unused for PLL programming; the machine
++      driver announces the actual BCLK rate via set_sysclk() instead.
++
+ required:
+   - compatible
+   - reg
+diff --git a/sound/soc/codecs/tlv320adc3xxx.c b/sound/soc/codecs/tlv320adc3xxx.c
+index bceceb272..7168eb390 100644
+--- a/sound/soc/codecs/tlv320adc3xxx.c
++++ b/sound/soc/codecs/tlv320adc3xxx.c
+@@ -255,6 +255,16 @@
+ 
+ #define ADC3XXX_USE_PLL	((ADC3XXX_PLL_CLKIN_MCLK << ADC3XXX_PLL_CLKIN_SHIFT) | \
+ 			 (ADC3XXX_CODEC_CLKIN_PLL_CLK << ADC3XXX_CODEC_CLKIN_SHIFT))
++/*
++ * Same as ADC3XXX_USE_PLL but the PLL is fed from BCLK rather than MCLK.
++ * Used on boards that route only BCLK/WCLK (and data) to the ADC and no
++ * MCLK pin — e.g. the Poly Trio C60, where the SAI's TX bit clock is the
++ * only clock the ADC ever sees. Selected via the "ti,pll-bclk-input" DT
++ * property. (CLKGEN_MUX = 0x07: PLL_CLKIN=BCLK, CODEC_CLKIN=PLL.)
++ */
++#define ADC3XXX_USE_PLL_BCLK \
++			((ADC3XXX_PLL_CLKIN_BCLK << ADC3XXX_PLL_CLKIN_SHIFT) | \
++			 (ADC3XXX_CODEC_CLKIN_PLL_CLK << ADC3XXX_CODEC_CLKIN_SHIFT))
+ #define ADC3XXX_NO_PLL	((ADC3XXX_PLL_CLKIN_ZERO << ADC3XXX_PLL_CLKIN_SHIFT) | \
+ 			 (ADC3XXX_CODEC_CLKIN_MCLK << ADC3XXX_CODEC_CLKIN_SHIFT))
+ 
+@@ -349,6 +359,11 @@ struct adc3xxx {
+ 	 * as a clock consumer rather than the bus master.
+ 	 */
+ 	bool is_secondary;
++	/* When set, the PLL is clocked from BCLK instead of MCLK (board has
++	 * no MCLK wired to the ADC). Set from the "ti,pll-bclk-input" DT
++	 * property; changes CLKGEN_MUX programming in hw_params.
++	 */
++	bool pll_bclk_input;
+ 	struct gpio_chip gpio_chip;
+ };
+ 
+@@ -529,6 +544,12 @@ static const struct adc3xxx_rate_divs adc3xxx_divs[] = {
+ 	{ 12288000, 48000, 1, 1, 7, 0000, 7, 2, 128 },
+ 	{ 24576000, 48000, 1, 1, 3, 5000, 7, 2, 128 }, /* With PLL */
+ 	{ 24576000, 48000, 0, 0, 0, 0000, 2, 2, 128 }, /* Without PLL */
++	/*
++	 * PLL fed from BCLK (ti,pll-bclk-input). "mclk" here is the BCLK rate
++	 * (2 slots x 16 bit x 48 kHz = 1.536 MHz on the Poly C60). PLL out =
++	 * 1.536M x R x J / P = 98.304 MHz; /NADC/MADC/AOSR = 48 kHz.
++	 */
++	{ 1536000, 48000, 1, 2, 32, 0000, 8, 2, 128 }, /* PLL from BCLK */
+ 	/* 88.2k rate */
+ 	{ 12000000, 88200, 1, 1, 7, 5264, 4, 4, 64 },
+ 	/* 96k rate */
+@@ -1202,8 +1223,11 @@ static int adc3xxx_hw_params(struct snd_pcm_substream *substream,
+ 	snd_soc_component_update_bits(component, ADC3XXX_INTERFACE_CTRL_1,
+ 				      ADC3XXX_WLENGTH_MASK, iface_len);
+ 	if (adc3xxx_divs[i].pll_p) { /* If PLL used for this mode */
++		unsigned int clkgen = adc3xxx->pll_bclk_input ?
++				      ADC3XXX_USE_PLL_BCLK : ADC3XXX_USE_PLL;
++
+ 		adc3xxx_setup_pll(component, i);
+-		snd_soc_component_write(component, ADC3XXX_CLKGEN_MUX, ADC3XXX_USE_PLL);
++		snd_soc_component_write(component, ADC3XXX_CLKGEN_MUX, clkgen);
+ 		if (!adc3xxx->use_pll) {
+ 			snd_soc_dapm_add_routes(dapm, adc3xxx_pll_intercon,
+ 						ARRAY_SIZE(adc3xxx_pll_intercon));
+@@ -1507,6 +1531,15 @@ static int adc3xxx_i2c_probe(struct i2c_client *i2c)
+ 		adc3xxx->is_secondary = match->is_secondary;
+ 	}
+ 
++	/*
++	 * On boards with no MCLK routed to the ADC, the PLL must be fed from
++	 * BCLK. The (still mandatory) "mclk" clock then only supplies the
++	 * codec's PLL reference *rate* to the divider search; the machine
++	 * driver announces the actual BCLK rate via set_sysclk().
++	 */
++	adc3xxx->pll_bclk_input =
++		of_property_read_bool(dev->of_node, "ti,pll-bclk-input");
++
+ 	/*
+ 	 * -secondary variants share a reset line with the bus-master chip
+ 	 * (or rely on POR), so reset-gpios is optional. When present we

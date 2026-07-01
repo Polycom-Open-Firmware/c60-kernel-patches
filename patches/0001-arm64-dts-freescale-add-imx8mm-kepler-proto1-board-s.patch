@@ -1,7 +1,11 @@
-From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
-From: Alex Camilo <alex.camilo@gmail.com>
-Date: Wed, 13 May 2026 16:00:00 -0400
-Subject: [PATCH] arm64: dts: freescale: add imx8mm-kepler-proto1 board support
+From db4d348ffc7597369c342858faff39c36215adaa Mon Sep 17 00:00:00 2001
+From: PolyOpenFirmware <alex.camilo@gmail.com>
+Date: Wed, 1 Jul 2026 15:32:14 +0000
+Subject: [PATCH 1/9] arm64: dts: freescale: add imx8mm-kepler-proto1 board
+ support
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Add a device tree for the Poly Trio C60 ("Kepler proto1") conference
 phone, an i.MX 8M Mini Quad design. Sister to imx8mm-tc8.dts; reuses
@@ -9,12 +13,14 @@ the same RTL8363NB-VB DSA switch driver, TAS5751M codec, BD71837 PMIC,
 and FEC fixed-PHY conduit work introduced for the TC8.
 
 Currently enabled: console (ttymxc1), eMMC (USDHC3), FEC + RTL DSA
-switch with lan/pc user ports, BD71837 PMIC, audio (TAS5751M on SAI1).
+switch with lan/pc user ports, BD71837 PMIC, and the full audio card
+(poly,c60-audio: TAS5751M speaker playback + 3x TLV320ADC3101 mic-array
+capture on SAI1).
 
 Stubbed (status = "disabled", board chips physically present but
 mainline driver bring-up not yet done): TC358743 HDMI-in bridge,
-ADV7535 HDMI-out, RM67191 DSI panel, Focaltech FTS touch, ADC3101 mic
-codec, LP5569 LEDs, IR receiver, brcmfmac WiFi/BT on PCIe.
+ADV7535 HDMI-out, RM67191 DSI panel, Focaltech FTS touch, LP5569 LEDs,
+IR receiver, brcmfmac WiFi/BT on PCIe.
 
 Verified booting Debian 12 / 6.6 on a kepler_proto1 unit via Android
 `boota` + AVB orange (testkey signing) — same flash flow as the
@@ -22,26 +28,26 @@ TC8. Slot B Polycom Android remains untouched as recovery.
 
 Signed-off-by: Alex Camilo <alex.camilo@gmail.com>
 ---
- arch/arm64/boot/dts/freescale/Makefile             |   1 +
- .../boot/dts/freescale/imx8mm-kepler-proto1.dts    | 587 ++++++
- 2 files changed, 588 insertions(+)
+ arch/arm64/boot/dts/freescale/Makefile        |   1 +
+ .../dts/freescale/imx8mm-kepler-proto1.dts    | 922 ++++++++++++++++++
+ 2 files changed, 923 insertions(+)
  create mode 100644 arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
 
 diff --git a/arch/arm64/boot/dts/freescale/Makefile b/arch/arm64/boot/dts/freescale/Makefile
-index 7cae75aa3..7cae75aa3 100644
+index 89aee6c92..970bcf1fe 100644
 --- a/arch/arm64/boot/dts/freescale/Makefile
 +++ b/arch/arm64/boot/dts/freescale/Makefile
-@@ -178,3 +178,4 @@ dtb-$(CONFIG_ARCH_MXC) += imx8mp-venice-gw74xx-rpidsi.dtb
+@@ -176,3 +176,4 @@ dtb-$(CONFIG_ARCH_MXC) += imx8mp-venice-gw74xx-rpidsi.dtb
  dtb-$(CONFIG_ARCH_S32) += s32g274a-evb.dtb
  dtb-$(CONFIG_ARCH_S32) += s32g274a-rdb2.dtb
  dtb-$(CONFIG_ARCH_S32) += s32v234-evb.dtb
 +dtb-$(CONFIG_ARCH_MXC) += imx8mm-kepler-proto1.dtb
 diff --git a/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
 new file mode 100644
-index 000000000..0000000000
+index 000000000..3dee9c390
 --- /dev/null
 +++ b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
-@@ -0,0 +1,1000 @@
+@@ -0,0 +1,922 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +// Polycom Trio C60 (Kepler proto1) — incremental DT on top of EVK base.
 +//
@@ -238,6 +244,7 @@ index 000000000..0000000000
 +		compatible = "ti,tas5751";
 +		reg = <0x2b>;
 +		#sound-dai-cells = <0>;
++		sound-name-prefix = "Spk";
 +		status = "okay";
 +	};
 +
@@ -245,12 +252,16 @@ index 000000000..0000000000
 +	 *
 +	 * Topology: three parallel RX data lanes, one stereo I2S
 +	 * pair per chip — RXD0 -> @0x1b, RXD1 -> @0x19, RXD2 -> @0x18.
-+	 * @0x1b is the clock-master candidate (drives BCLK/WCLK) and is the
-+	 * only chip with a reset-gpios line; the other two are clock
-+	 * consumers and use the new -secondary compatible (patch 0003) so
-+	 * the driver skips the reset pulse and forces CBC_CFC.
++	 * @0x1b is the only chip with a reset-gpios line; the other two are
++	 * secondary parts (patch 0003 -secondary compatible) that share the
++	 * reset rail so the driver skips the reset pulse.
 +	 *
-+	 * MCLK = 12.288 MHz, derived from IMX8MM_CLK_SAI1 (re-parented to
++	 * SAI1 RX is HW-synced to TX (no RX_BCLK/RX_SYNC pads), so the SAI is
++	 * the sole BCLK/WCLK provider and ALL three ADCs are clock consumers.
++	 * The poly,c60-audio machine driver sets I2S | NB_NF | CBC_CFC on
++	 * every codec, including @0x1b.
++	 *
++	 * MCLK = 24.576 MHz, from IMX8MM_CLK_SAI1 (re-parented to
 +	 * AUDIO_PLL1_OUT in &sai1 below). 48 kHz / 32-bit slots / plain I2S
 +	 * per lane — chip defaults are correct, no dai-tdm-slot-* needed.
 +	 */
@@ -262,17 +273,13 @@ index 000000000..0000000000
 +		clock-names = "mclk";
 +		pinctrl-names = "default";
 +		pinctrl-0 = <&pinctrl_mic_adc>;
++		/* No MCLK is routed to the ADCs on the C60 — the SAI TX bit
++		 * clock (kept running for the TX-synced RX) is their only
++		 * clock, so the PLL is fed from BCLK, not MCLK. */
++		ti,pll-bclk-input;
 +		#sound-dai-cells = <0>;
++		sound-name-prefix = "Mic0";
 +		status = "okay";
-+
-+		port {
-+			mic_adc0_ep: endpoint {
-+				remote-endpoint = <&sai1_rx_codec0_ep_back>;
-+				bitclock-master;  /* documents intent;
-+						   * codec is consumer at runtime */
-+				frame-master;
-+			};
-+		};
 +	};
 +
 +	mic_adc1: audio-codec@19 {
@@ -283,14 +290,10 @@ index 000000000..0000000000
 +		reg = <0x19>;
 +		clocks = <&clk IMX8MM_CLK_SAI1>;
 +		clock-names = "mclk";
++		ti,pll-bclk-input;
 +		#sound-dai-cells = <0>;
++		sound-name-prefix = "Mic1";
 +		status = "okay";
-+
-+		port {
-+			mic_adc1_ep: endpoint {
-+				remote-endpoint = <&sai1_rx_codec1_ep_back>;
-+			};
-+		};
 +	};
 +
 +	mic_adc2: audio-codec@18 {
@@ -299,14 +302,10 @@ index 000000000..0000000000
 +		reg = <0x18>;
 +		clocks = <&clk IMX8MM_CLK_SAI1>;
 +		clock-names = "mclk";
++		ti,pll-bclk-input;
 +		#sound-dai-cells = <0>;
++		sound-name-prefix = "Mic2";
 +		status = "okay";
-+
-+		port {
-+			mic_adc2_ep: endpoint {
-+				remote-endpoint = <&sai1_rx_codec2_ep_back>;
-+			};
-+		};
 +	};
 +};
 +
@@ -777,7 +776,7 @@ index 000000000..0000000000
 +	pinctrl-0 = <&pinctrl_sai1>, <&pinctrl_sai1_rx>;
 +	assigned-clocks = <&clk IMX8MM_CLK_SAI1>;
 +	assigned-clock-parents = <&clk IMX8MM_AUDIO_PLL1_OUT>;
-+	assigned-clock-rates = <24576000>;
++	assigned-clock-rates = <12288000>;
 +	fsl,sai-mclk-direction-output;
 +	status = "okay";
 +
@@ -801,7 +800,7 @@ index 000000000..0000000000
 +	 * NOTE: type 0 is "DEFAULT" per fsl_sai_read_dlcfg(), i.e. the same
 +	 * as omitting the property; type=1 is used here for explicit I2S.
 +	 * ============================================================ */
-+	fsl,dataline = <1 0x07 0x01>;
++	fsl,dataline = <0 0xff 0xff>;
 +
 +	/* ============================================================ *
 +	 * dmas override: switch RX DMA to MULTI_SAI (IMX_DMATYPE = 25 / 0x19)
@@ -831,44 +830,44 @@ index 000000000..0000000000
 +	 * fsl,tx-dline-mask = <0x01>;
 +	 * ============================================================ */
 +
-+	/* Graph port for audio-graph-card2 sound-mics card.
-+	 * SAI1 TX (TAS5751M) stays on the legacy simple-audio-card path
-+	 * via &sai1 / sound-dai — no graph port for TX. If/when TX is
-+	 * migrated to graph-card2 too, add port@1 for it; reg=0 is RX. */
-+	ports {
-+		#address-cells = <1>;
-+		#size-cells = <0>;
-+		sai1_rx_cpu_port: port@0 {
-+			reg = <0>;	/* RX (mic array) */
-+			sai1_rx_cpu_ep: endpoint {
-+				remote-endpoint = <&sai1_rx_multi_ep>;
-+			};
-+		};
-+	};
++	/* No graph ports: the poly,c60-audio machine driver references &sai1
++	 * directly via the sound node's poly,audio-cpu phandle. fsl_sai
++	 * registers ONE ASoC component with ONE DAI carrying both TX
++	 * (TAS5751M playback) + RX (3-codec mic capture); the machine driver
++	 * puts that single DAI in two links of ONE card. SAI is the
++	 * bitclock/frame provider (set in C as CBC_CFC on the codecs); the
++	 * driver programs dai-tdm-slot-num=2 on the SAI at hw_params so
++	 * sai->slots=2 => 3 RX lanes @6ch / 1 lane @2ch. */
 +};
 +
++/* --------------------------------------------------------------------- */
++/* Unified sound card: ONE snd_soc_card with TWO dai_links, both cpu=&sai1
++ * (legal: one component may appear in multiple links of the SAME card):
++ *
++ *   link 0  Speaker    codec  = &tas5751               (playback)
++ *   link 1  Mic Array  codecs = &mic_adc0/1/2          (capture, multi-codec)
++ *
++ * A machine driver (poly,c60-audio) is used instead of audio-graph-card2
++ * because graph-card2 hands the primary ADC a mixed bit/frame clock role,
++ * which tlv320adc3xxx rejects in adc3xxx_set_dai_fmt() with -EINVAL. The
++ * driver sets I2S | NB_NF | CBC_CFC explicitly on both links so the SAI is
++ * the sole clock provider and every codec is a pure consumer. Replaces the
++ * failed sound-kepler audio-graph-card2 node.
++ */
 +/ {
-+	sound-tas5751 {
-+		compatible = "simple-audio-card";
-+		simple-audio-card,name = "c60-tas5751";
-+		simple-audio-card,format = "i2s";
-+		simple-audio-card,frame-master = <&c60_sai1_cpudai>;
-+		simple-audio-card,bitclock-master = <&c60_sai1_cpudai>;
-+		simple-audio-card,widgets =
-+			"Speaker", "Handsfree Speaker";
-+		simple-audio-card,routing =
-+			"Handsfree Speaker", "OUT_A",
-+			"Handsfree Speaker", "OUT_B";
-+
-+		c60_sai1_cpudai: simple-audio-card,cpu {
-+			sound-dai = <&sai1>;
-+			dai-tdm-slot-num = <2>;
-+			dai-tdm-slot-width = <16>;
-+		};
-+
-+		simple-audio-card,codec {
-+			sound-dai = <&tas5751>;
-+		};
++	sound {
++		compatible = "poly,c60-audio";
++		model = "kepler-c60";
++		poly,audio-cpu = <&sai1>;
++		poly,audio-dac-codec = <&tas5751>;
++		poly,audio-adc-codec = <&mic_adc0 &mic_adc1 &mic_adc2>;
++		poly,widgets =
++			"Speaker", "Handsfree Speaker",
++			"Microphone", "Mic Array";
++		poly,routing =
++			"Handsfree Speaker", "Spk OUT_A",
++			"Handsfree Speaker", "Spk OUT_B";
++		status = "okay";
 +	};
 +};
 +
@@ -896,79 +895,8 @@ index 000000000..0000000000
 +};
 +
 +/* --------------------------------------------------------------------- */
-+/* Mic-array sound card: 3 × TLV320ADC3101 on SAI1 RX, Semi-Multi shape.
-+ *
-+ * One CPU DAI (SAI1 RX) <-> three codec endpoints (one per RXDn lane).
-+ * Pattern: linux-6.6/sound/soc/generic/audio-graph-card2-custom-sample.dtsi
-+ * "Semi-Multi" links — single CPU port, multi ports@N fan to N codec
-+ * endpoints.
-+ *
-+ * Routing is left empty until the physical mic-to-channel mapping is
-+ * confirmed; widgets are nominal labels for now.
-+ *
-+ * Lives alongside the existing sound-tas5751 simple-audio-card. SAI1 can
-+ * back two cards because TX (speaker) and RX (mics) are independent
-+ * substreams in the fsl-sai driver.
-+ */
-+/ {
-+	sound-mics {
-+		compatible = "audio-graph-card2";
-+		label = "kepler-mics";
-+		/* Speaker-only for now: mic capture (graph-card2 multi) is a
-+		 * follow-up. Disable the card so the installed image ships working
-+		 * audio playback; the mic codec nodes stay for the mic bring-up. */
-+		status = "disabled";
-+
-+		widgets =
-+			"Microphone", "Internal Mic Front-Pair",
-+			"Microphone", "Internal Mic Side-Pair",
-+			"Microphone", "External Mic Ports";
-+		/* routing left minimal until physical-mic mapping is
-+		 * confirmed. */
-+
-+		links = <&sai1_rx_cpu_port>;
-+
-+		multi {
-+			#address-cells = <1>;
-+			#size-cells = <0>;
-+
-+			ports@0 {
-+				reg = <0>;
-+				#address-cells = <1>;
-+				#size-cells = <0>;
-+				port@0 {
-+					reg = <0>;
-+					sai1_rx_multi_ep: endpoint {
-+						remote-endpoint = <&sai1_rx_cpu_ep>;
-+					};
-+				};
-+				port@1 {
-+					reg = <1>;
-+					sai1_rx_codec0_ep_back: endpoint {
-+						remote-endpoint = <&mic_adc0_ep>;
-+					};
-+				};
-+				port@2 {
-+					reg = <2>;
-+					sai1_rx_codec1_ep_back: endpoint {
-+						remote-endpoint = <&mic_adc1_ep>;
-+					};
-+				};
-+				port@3 {
-+					reg = <3>;
-+					sai1_rx_codec2_ep_back: endpoint {
-+						remote-endpoint = <&mic_adc2_ep>;
-+					};
-+				};
-+			};
-+		};
-+	};
-+};
-+
-+/* --------------------------------------------------------------------- */
 +/* Things still TODO (do not enable in starter DT):
 + *
-+ *   - sound-kepler card (TAS5751 + 3x ADC3101 + kepler-audio glue)
 + *   - sound-tchdmiaudio (SAI3 capture path off the TC358743)
 + *   - bt-audio (SAI2, brcm BT SCO link)
 + *   - dect-audio (SAI5) — DECT cordless handset; very probably proprietary

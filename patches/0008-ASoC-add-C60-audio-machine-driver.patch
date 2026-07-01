@@ -1,0 +1,461 @@
+From fbc2ea73f93087ef91bb7963f5d047fe9b21468f Mon Sep 17 00:00:00 2001
+From: PolyOpenFirmware <alex.camilo@gmail.com>
+Date: Wed, 1 Jul 2026 15:32:14 +0000
+Subject: [PATCH 8/9] ASoC: add C60 audio machine driver
+
+Add a machine driver (poly,c60-audio) for the Poly Trio C60 (i.MX 8M
+Mini "Kepler"). One snd_soc_card exposes BOTH directions of SAI1 as two
+DAI links that share the single fsl_sai DAI:
+
+  link 0  "Speaker"    cpu=SAI1  codec  = TAS5751M            (playback)
+  link 1  "Mic Array"  cpu=SAI1  codecs = 3x TLV320ADC3101    (capture)
+
+The C60 wires SAI1 RX hard-synced to TX (no RX_BCLK/RX_SYNC pads), so
+the SAI is the sole bit-clock and frame provider for both directions and
+every codec is a pure clock consumer. The driver therefore fixes the DAI
+format in C to I2S | NB_NF | CBC_CFC on both links.
+
+This fixed format is the whole reason a machine driver is needed instead
+of a DT-only audio-graph-card2 card: graph-card2 hands the primary ADC a
+mixed bit/frame clock role, and tlv320adc3xxx only accepts a full
+provider (CBP_CFP) or full consumer (CBC_CFC) role, bailing out of
+adc3xxx_set_dai_fmt() with -EINVAL ("Invalid DAI clock setup").
+
+The three ADCs each present a stereo I2S pair on their own SAI RX data
+line (RXD0/1/2); the SAI de-interleaves the three lanes into one
+6-channel capture stream via its MULTI_SAI DMA. The capture link's
+hw_params programs 2 TDM slots on the CPU DAI so the SAI splits the
+stream across 3 data lanes (pins = DIV_ROUND_UP(channels, slots) = 3),
+and announces the 24.576 MHz MCLK to each ADC so tlv320adc3xxx can
+resolve a PLL/divider table entry.
+
+Codecs are resolved from DT phandle lists (poly,audio-cpu,
+poly,audio-dac-codec, poly,audio-adc-codec); optional DAPM widgets and
+routing come from poly,widgets / poly,routing.
+
+Signed-off-by: Poly Open Firmware <alex.camilo@gmail.com>
+---
+ sound/soc/fsl/Kconfig     |  16 ++
+ sound/soc/fsl/Makefile    |   2 +
+ sound/soc/fsl/c60-audio.c | 368 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 386 insertions(+)
+ create mode 100644 sound/soc/fsl/c60-audio.c
+
+diff --git a/sound/soc/fsl/Kconfig b/sound/soc/fsl/Kconfig
+index 725c530a3..2996f5fcc 100644
+--- a/sound/soc/fsl/Kconfig
++++ b/sound/soc/fsl/Kconfig
+@@ -381,6 +381,22 @@ config SND_SOC_IMX_CARD
+ 	  with OF-graph DT bindings.
+ 	  It also support DPCM of single CPU multi Codec ststem.
+ 
++config SND_SOC_C60_AUDIO
++	tristate "SoC Audio support for the Poly Trio C60 (Kepler)"
++	depends on OF && I2C
++	select SND_SOC_FSL_SAI
++	select SND_SOC_IMX_PCM_DMA
++	select SND_SOC_TAS571X
++	select SND_SOC_TLV320ADC3XXX
++	help
++	  Machine driver for the Poly Trio C60 (i.MX 8M Mini "Kepler"): a
++	  single sound card exposing TAS5751M speaker playback and a
++	  3 x TLV320ADC3101 microphone-array capture, both on SAI1. The
++	  driver fixes the DAI format to I2S / CBC_CFC in C (SAI is the sole
++	  clock provider) which the codecs accept where audio-graph-card2's
++	  mixed clock role does not.
++	  Say Y if you are building for the Poly Trio C60.
++
+ endif # SND_IMX_SOC
+ 
+ endmenu
+diff --git a/sound/soc/fsl/Makefile b/sound/soc/fsl/Makefile
+index 8db7e97d0..e84e12e37 100644
+--- a/sound/soc/fsl/Makefile
++++ b/sound/soc/fsl/Makefile
+@@ -74,6 +74,7 @@ snd-soc-imx-audmix-objs := imx-audmix.o
+ snd-soc-imx-hdmi-objs := imx-hdmi.o
+ snd-soc-imx-rpmsg-objs := imx-rpmsg.o
+ snd-soc-imx-card-objs := imx-card.o
++snd-soc-c60-audio-objs := c60-audio.o
+ 
+ obj-$(CONFIG_SND_SOC_EUKREA_TLV320) += snd-soc-eukrea-tlv320.o
+ obj-$(CONFIG_SND_SOC_IMX_ES8328) += snd-soc-imx-es8328.o
+@@ -83,3 +84,4 @@ obj-$(CONFIG_SND_SOC_IMX_AUDMIX) += snd-soc-imx-audmix.o
+ obj-$(CONFIG_SND_SOC_IMX_HDMI) += snd-soc-imx-hdmi.o
+ obj-$(CONFIG_SND_SOC_IMX_RPMSG) += snd-soc-imx-rpmsg.o
+ obj-$(CONFIG_SND_SOC_IMX_CARD) += snd-soc-imx-card.o
++obj-$(CONFIG_SND_SOC_C60_AUDIO) += snd-soc-c60-audio.o
+diff --git a/sound/soc/fsl/c60-audio.c b/sound/soc/fsl/c60-audio.c
+new file mode 100644
+index 000000000..c8082feaf
+--- /dev/null
++++ b/sound/soc/fsl/c60-audio.c
+@@ -0,0 +1,368 @@
++// SPDX-License-Identifier: GPL-2.0
++//
++// c60-audio.c - ASoC machine driver for the Poly Trio C60 (Kepler proto1).
++//
++// One sound card, two DAI links, both driven by the single i.MX 8M Mini
++// SAI1 DAI (which carries playback and capture on a shared, TX-synced
++// bitclock/frame):
++//
++//   link 0  "Speaker"    cpu = SAI1  codec  = TAS5751M           (playback)
++//   link 1  "Mic Array"  cpu = SAI1  codecs = 3x TLV320ADC3101   (capture)
++//
++// The C60 wires SAI1 RX hard-synced to TX (there are no RX_BCLK/RX_SYNC
++// pads), so the SAI is the bit-clock and frame provider for BOTH directions
++// and every codec is a pure clock consumer. We therefore fix the DAI format
++// in C to I2S | NB_NF | CBC_CFC on both links.
++//
++// This fixed format is the entire reason a machine driver exists instead of
++// a DT-only audio-graph-card2: graph-card2 handed the primary ADC a *mixed*
++// clock role (bit-provider/frame-consumer or vice-versa), and
++// tlv320adc3xxx only accepts a full-provider (CBP_CFP) or full-consumer
++// (CBC_CFC) role - it rejects anything else out of adc3xxx_set_dai_fmt()
++// with -EINVAL ("Invalid DAI clock setup").
++//
++// The three ADCs each present a stereo I2S pair on their own SAI RX data
++// line (RXD0/1/2); the SAI de-interleaves the three lanes into one
++// 6-channel capture stream via its MULTI_SAI DMA. To make the SAI split
++// the stream across 3 lanes we program 2 TDM slots on the CPU DAI at
++// hw_params (pins = DIV_ROUND_UP(channels, slots) = 3 for 6ch).
++//
++// The C60 does NOT route MCLK to the three ADCs (only the TAS5751M DAC gets
++// it); the ADCs' only clock is the SAI TX bit clock (BCLK), which the SAI
++// keeps running for capture because RX is synchronous to TX. Each ADC's DT
++// therefore carries "ti,pll-bclk-input" so tlv320adc3xxx PLLs off BCLK, and
++// this driver announces the BCLK *rate* (slots x width x rate) via set_sysclk
++// so the codec can resolve its PLL/divider table entry.
++
++#include <linux/bits.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <sound/control.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/soc-card.h>
++#include <sound/soc-dai.h>
++
++/*
++ * SAI1 root/MCLK rate (see &sai1 assigned-clock-rates in DT). This feeds the
++ * TAS5751M DAC directly; the ADCs instead run off BCLK = MCLK/8 (below).
++ */
++#define C60_MCLK_HZ		12288000
++
++/*
++ * SAI is bit-clock + frame provider for both directions; every codec
++ * consumes both clocks. Fixed I2S, normal bit + frame clock polarity.
++ */
++#define C60_DAI_FMT		(SND_SOC_DAIFMT_I2S | \
++				 SND_SOC_DAIFMT_NB_NF | \
++				 SND_SOC_DAIFMT_CBC_CFC)
++
++/* 2 TDM slots so the SAI fans 6ch capture across RXD0/1/2 (3 data lanes). */
++#define C60_TDM_SLOTS		2
++#define C60_TDM_SLOT_WIDTH	16
++
++enum {
++	C60_LINK_SPK = 0,	/* playback: TAS5751M              */
++	C60_LINK_MIC,		/* capture:  3x TLV320ADC3101      */
++	C60_NUM_LINKS
++};
++
++struct c60_audio {
++	struct snd_soc_card card;
++	struct snd_soc_dai_link links[C60_NUM_LINKS];
++	struct snd_soc_dai_link_component cpu[C60_NUM_LINKS];
++	struct snd_soc_dai_link_component platform[C60_NUM_LINKS];
++	struct snd_soc_dai_link_component dac;
++	/* adc[] is sized to the poly,audio-adc-codec phandle count. */
++	struct snd_soc_dai_link_component *adc;
++};
++
++/*
++ * Capture-link runtime setup. The SAI needs 2 TDM slots to spread the
++ * 6-channel stream over its three RX data lanes, and each ADC needs its
++ * MCLK rate so tlv320adc3xxx can pick a PLL/divider entry.
++ */
++static int c60_mic_hw_params(struct snd_pcm_substream *substream,
++			     struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
++	struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(rtd, 0);
++	struct snd_soc_dai *codec_dai;
++	unsigned int bclk;
++	int i, ret;
++
++	ret = snd_soc_dai_set_tdm_slot(cpu_dai, GENMASK(C60_TDM_SLOTS - 1, 0),
++				       GENMASK(C60_TDM_SLOTS - 1, 0),
++				       C60_TDM_SLOTS, C60_TDM_SLOT_WIDTH);
++	if (ret && ret != -ENOTSUPP) {
++		dev_err(rtd->dev, "failed to set SAI TDM slots: %d\n", ret);
++		return ret;
++	}
++
++	/*
++	 * The ADCs PLL off BCLK (no MCLK is wired to them), so announce the
++	 * BCLK rate the SAI generates for this frame: slots x width x rate
++	 * (2 x 16 x 48000 = 1.536 MHz). tlv320adc3xxx uses this as its PLL
++	 * reference to pick a divider entry.
++	 */
++	bclk = C60_TDM_SLOTS * C60_TDM_SLOT_WIDTH * params_rate(params);
++
++	for_each_rtd_codec_dais(rtd, i, codec_dai) {
++		ret = snd_soc_dai_set_sysclk(codec_dai, 0, bclk,
++					     SND_SOC_CLOCK_IN);
++		if (ret && ret != -ENOTSUPP) {
++			dev_err(rtd->dev, "%s: failed to set BCLK: %d\n",
++				codec_dai->name, ret);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static const struct snd_soc_ops c60_mic_ops = {
++	.hw_params = c60_mic_hw_params,
++};
++
++/*
++ * Resolve one phandle from @prop[@index] into a dai_link_component. On
++ * success @dlc->of_node and @dlc->dai_name are populated and the of_node
++ * reference is held for the lifetime of the card. Returns -EPROBE_DEFER
++ * until the referenced CPU/codec component has registered.
++ */
++static int c60_resolve_dlc(struct device *dev, struct device_node *np,
++			   const char *prop, int index,
++			   struct snd_soc_dai_link_component *dlc)
++{
++	struct of_phandle_args args = { };
++	int ret;
++
++	args.np = of_parse_phandle(np, prop, index);
++	if (!args.np)
++		return dev_err_probe(dev, -EINVAL,
++				     "missing phandle %s[%d]\n", prop, index);
++
++	/* #sound-dai-cells = 0 on the SAI and on every C60 codec. */
++	args.args_count = 0;
++
++	ret = snd_soc_get_dlc(&args, dlc);
++	if (ret) {
++		of_node_put(args.np);
++		return dev_err_probe(dev, ret, "failed to resolve %s[%d]\n",
++				     prop, index);
++	}
++
++	/* snd_soc_get_dlc() stored args.np in dlc->of_node; keep the ref. */
++	return 0;
++}
++
++/*
++ * Fixed analog capture setup.
++ *
++ * The C60's mic wiring is hard-wired: each ADC's PGA is soldered to a
++ * specific differential input pair, and there is no userspace mixer agent to
++ * bring the capture path up. So at card bring-up we force the stock input mux
++ * routing, +12 dB analog PGA gain and FGA unmute, exactly as the vendor
++ * firmware does, so a fresh boot captures real audio without any amixer step.
++ *
++ * Enabling an input-mux switch also marks that DAPM path "connected", which
++ * is what lets DAPM power the ADC + PLL/NADC/MADC clock chain when a capture
++ * stream starts (an all-off input mux leaves the ADC unpowered). ADC/PGA
++ * power and PGA mute themselves are left to DAPM, resolved at stream start.
++ *
++ * Controls are codec-prefixed via each ADC's DT sound-name-prefix
++ * (Mic0=@0x1b, Mic1=@0x19, Mic2=@0x18), so the names are unambiguous.
++ */
++struct c60_ctl_default {
++	const char *name;
++	long val[2];
++	unsigned int count;
++};
++
++static const struct c60_ctl_default c60_capture_defaults[] = {
++	/* Differential input pair feeding each ADC (stock RE routing). */
++	{ "Mic0 Left Input DIF_2R_3R Capture Switch",  { 1 },    1 },
++	{ "Mic0 Right Input DIF_1L_1R Capture Switch", { 1 },    1 },
++	{ "Mic1 Left Input DIF_2R_3R Capture Switch",  { 1 },    1 },
++	{ "Mic1 Right Input DIF_1L_1R Capture Switch", { 1 },    1 },
++	{ "Mic2 Left Input DIF_1L_1R Capture Switch",  { 1 },    1 },
++	{ "Mic2 Right Input DIF_2L_3L Capture Switch", { 1 },    1 },
++	/* Analog PGA gain +12 dB (24 * 0.5 dB), left+right. */
++	{ "Mic0 PGA Capture Volume",                   { 24, 24 }, 2 },
++	{ "Mic1 PGA Capture Volume",                   { 24, 24 }, 2 },
++	{ "Mic2 PGA Capture Volume",                   { 24, 24 }, 2 },
++	/* FGA unmute, left+right. */
++	{ "Mic0 PGA Capture Switch",                   { 1, 1 },  2 },
++	{ "Mic1 PGA Capture Switch",                   { 1, 1 },  2 },
++	{ "Mic2 PGA Capture Switch",                   { 1, 1 },  2 },
++};
++
++static int c60_apply_ctl(struct snd_soc_card *card,
++			 const struct c60_ctl_default *d)
++{
++	struct snd_kcontrol *kc = snd_soc_card_get_kcontrol(card, d->name);
++	struct snd_ctl_elem_value *uc;
++	unsigned int i;
++	int ret;
++
++	if (!kc) {
++		dev_warn(card->dev, "capture default: control '%s' not found\n",
++			 d->name);
++		return 0;
++	}
++
++	uc = kzalloc(sizeof(*uc), GFP_KERNEL);
++	if (!uc)
++		return -ENOMEM;
++	for (i = 0; i < d->count; i++)
++		uc->value.integer.value[i] = d->val[i];
++
++	ret = kc->put(kc, uc);	/* >0 = value changed, 0 = unchanged */
++	kfree(uc);
++	if (ret < 0)
++		dev_warn(card->dev, "capture default: '%s' put failed: %d\n",
++			 d->name, ret);
++	return ret < 0 ? ret : 0;
++}
++
++/*
++ * Runs from snd_soc_card_fixup_controls(), i.e. AFTER
++ * snd_soc_dapm_new_widgets() has instantiated the codecs' DAPM mixer
++ * (input-mux) switch controls — unlike .late_probe, which runs before them
++ * and would only see the plain component controls. This is where we can set
++ * both the DAPM input switches and the PGA/FGA controls.
++ */
++static void c60_fixup_controls(struct snd_soc_card *card)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(c60_capture_defaults); i++)
++		c60_apply_ctl(card, &c60_capture_defaults[i]);
++}
++
++static int c60_audio_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct snd_soc_card *card;
++	struct c60_audio *priv;
++	int num_adc, i, ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	card = &priv->card;
++	card->dev = dev;
++	card->owner = THIS_MODULE;
++	card->dai_link = priv->links;
++	card->num_links = C60_NUM_LINKS;
++	/*
++	 * Force the fixed analog capture routing/gain once the card is up.
++	 * Use .fixup_controls (not .late_probe): it runs after the codecs'
++	 * DAPM input-mux switch controls have been created.
++	 */
++	card->fixup_controls = c60_fixup_controls;
++
++	/* Card name from DT "model", fall back to a fixed label. */
++	ret = snd_soc_of_parse_card_name(card, "model");
++	if (ret || !card->name)
++		card->name = "kepler-c60";
++
++	/*
++	 * CPU / platform: the single SAI1 DAI, shared by both links. It is
++	 * legal for one component to appear in multiple links of the SAME
++	 * card - only two separate cards would collide.
++	 */
++	ret = c60_resolve_dlc(dev, np, "poly,audio-cpu", 0, &priv->cpu[0]);
++	if (ret)
++		return ret;
++	priv->cpu[1] = priv->cpu[0];
++	priv->platform[0].of_node = priv->cpu[0].of_node;
++	priv->platform[1].of_node = priv->cpu[0].of_node;
++
++	/* DAC codec: TAS5751M (playback). */
++	ret = c60_resolve_dlc(dev, np, "poly,audio-dac-codec", 0, &priv->dac);
++	if (ret)
++		return ret;
++
++	/* ADC codecs: 3x TLV320ADC3101 (capture, multi-codec). */
++	num_adc = of_count_phandle_with_args(np, "poly,audio-adc-codec", NULL);
++	if (num_adc <= 0)
++		return dev_err_probe(dev, -EINVAL,
++				     "poly,audio-adc-codec missing\n");
++
++	priv->adc = devm_kcalloc(dev, num_adc, sizeof(*priv->adc), GFP_KERNEL);
++	if (!priv->adc)
++		return -ENOMEM;
++
++	for (i = 0; i < num_adc; i++) {
++		ret = c60_resolve_dlc(dev, np, "poly,audio-adc-codec", i,
++				      &priv->adc[i]);
++		if (ret)
++			return ret;
++	}
++
++	/* link 0: speaker playback (TAS5751M). */
++	priv->links[C60_LINK_SPK].name		= "Speaker";
++	priv->links[C60_LINK_SPK].stream_name	= "Speaker Playback";
++	priv->links[C60_LINK_SPK].cpus		= &priv->cpu[C60_LINK_SPK];
++	priv->links[C60_LINK_SPK].num_cpus	= 1;
++	priv->links[C60_LINK_SPK].platforms	= &priv->platform[C60_LINK_SPK];
++	priv->links[C60_LINK_SPK].num_platforms	= 1;
++	priv->links[C60_LINK_SPK].codecs	= &priv->dac;
++	priv->links[C60_LINK_SPK].num_codecs	= 1;
++	priv->links[C60_LINK_SPK].dai_fmt	= C60_DAI_FMT;
++	priv->links[C60_LINK_SPK].playback_only	= 1;
++
++	/* link 1: 3-mic capture (TLV320ADC3101 x N). */
++	priv->links[C60_LINK_MIC].name		= "Mic Array";
++	priv->links[C60_LINK_MIC].stream_name	= "Mic Array Capture";
++	priv->links[C60_LINK_MIC].cpus		= &priv->cpu[C60_LINK_MIC];
++	priv->links[C60_LINK_MIC].num_cpus	= 1;
++	priv->links[C60_LINK_MIC].platforms	= &priv->platform[C60_LINK_MIC];
++	priv->links[C60_LINK_MIC].num_platforms	= 1;
++	priv->links[C60_LINK_MIC].codecs	= priv->adc;
++	priv->links[C60_LINK_MIC].num_codecs	= num_adc;
++	priv->links[C60_LINK_MIC].dai_fmt	= C60_DAI_FMT;
++	priv->links[C60_LINK_MIC].capture_only	= 1;
++	priv->links[C60_LINK_MIC].ops		= &c60_mic_ops;
++
++	/* Optional DAPM widgets / routing from DT. */
++	if (of_property_read_bool(np, "poly,widgets")) {
++		ret = snd_soc_of_parse_audio_simple_widgets(card,
++							    "poly,widgets");
++		if (ret)
++			return ret;
++	}
++	if (of_property_read_bool(np, "poly,routing")) {
++		ret = snd_soc_of_parse_audio_routing(card, "poly,routing");
++		if (ret)
++			return ret;
++	}
++
++	return devm_snd_soc_register_card(dev, card);
++}
++
++static const struct of_device_id c60_audio_of_match[] = {
++	{ .compatible = "poly,c60-audio" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, c60_audio_of_match);
++
++static struct platform_driver c60_audio_driver = {
++	.driver = {
++		.name		= "c60-audio",
++		.of_match_table	= c60_audio_of_match,
++		.pm		= &snd_soc_pm_ops,
++	},
++	.probe = c60_audio_probe,
++};
++module_platform_driver(c60_audio_driver);
++
++MODULE_DESCRIPTION("Poly Trio C60 ASoC machine driver");
++MODULE_AUTHOR("Poly Open Firmware");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:c60-audio");

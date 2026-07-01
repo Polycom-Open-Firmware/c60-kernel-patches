@@ -184,10 +184,10 @@ index 0000000000000000000000000000000000000000..f9e4149ffc9c5677d112383feb705535
 +	/* Disable EVK-inherited HDMI bridge */
 +	hdmi@3d { status = "disabled"; };
 +
-+	/* TODO: FT touchscreen. Stock binding is the out-of-tree
-+	 * "focaltech,fts" with focaltech,panel-type = <0x73110002>. Mainline
-+	 * edt-ft5x06 may bind if the underlying silicon is FT5x06-class.
-+	 * Leave disabled until the panel is up. */
++	/* FocalTech FT5x46-class cap-touch (chip id 0x54 @ reg 0xa3). Stock
++	 * uses out-of-tree "focaltech,fts" (panel-type 0x73110002); mainline
++	 * edt-ft5x06 generic binding reads the same touch-report registers.
++	 * Enabled for finger-touch input without a panel attached. */
 +	touchscreen@38 {
 +		compatible = "edt,edt-ft5x06";
 +		reg = <0x38>;
@@ -198,7 +198,7 @@ index 0000000000000000000000000000000000000000..f9e4149ffc9c5677d112383feb705535
 +		reset-gpios = <&gpio2 3 GPIO_ACTIVE_LOW>;
 +		touchscreen-size-x = <720>;
 +		touchscreen-size-y = <1280>;
-+		status = "disabled";
++		status = "okay";
 +	};
 +
 +	/* kepler_cap @ 0x37 — vendor LED-ring MCU. No mainline driver;

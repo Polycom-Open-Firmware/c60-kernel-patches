@@ -16,11 +16,15 @@ mainline driver bring-up not yet done): TC358743 HDMI-in bridge,
 ADV7535 HDMI-out, RM67191 DSI panel, Focaltech FTS touch, ADC3101 mic
 codec, LP5569 LEDs, IR receiver, brcmfmac WiFi/BT on PCIe.
 
-Boots Debian 12 (kernel 6.6) on a kepler_proto1 unit.
+Verified booting Debian 12 / 6.6 on a kepler_proto1 unit via Android
+`boota` + AVB orange (testkey signing) — same flash flow as the
+TC8. Slot B Polycom Android remains untouched as recovery.
+
+Signed-off-by: Alex Camilo <alex.camilo@gmail.com>
 ---
  arch/arm64/boot/dts/freescale/Makefile             |   1 +
- .../boot/dts/freescale/imx8mm-kepler-proto1.dts    | 982 ++++++++++
- 2 files changed, 983 insertions(+)
+ .../boot/dts/freescale/imx8mm-kepler-proto1.dts    | 587 ++++++
+ 2 files changed, 588 insertions(+)
  create mode 100644 arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
 
 diff --git a/arch/arm64/boot/dts/freescale/Makefile b/arch/arm64/boot/dts/freescale/Makefile
@@ -34,10 +38,10 @@ index 7cae75aa3..7cae75aa3 100644
 +dtb-$(CONFIG_ARCH_MXC) += imx8mm-kepler-proto1.dtb
 diff --git a/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
 new file mode 100644
-index 0000000000000000000000000000000000000000..f9e4149ffc9c5677d112383feb70553506c86766
+index 000000000..0000000000
 --- /dev/null
 +++ b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
-@@ -0,0 +1,982 @@
+@@ -0,0 +1,1000 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +// Polycom Trio C60 (Kepler proto1) — incremental DT on top of EVK base.
 +//
@@ -184,10 +188,10 @@ index 0000000000000000000000000000000000000000..f9e4149ffc9c5677d112383feb705535
 +	/* Disable EVK-inherited HDMI bridge */
 +	hdmi@3d { status = "disabled"; };
 +
-+	/* FocalTech FT5x46-class cap-touch (chip id 0x54 @ reg 0xa3). Stock
-+	 * uses out-of-tree "focaltech,fts" (panel-type 0x73110002); mainline
-+	 * edt-ft5x06 generic binding reads the same touch-report registers.
-+	 * Enabled for finger-touch input without a panel attached. */
++	/* TODO: FT touchscreen. Stock binding is the out-of-tree
++	 * "focaltech,fts" with focaltech,panel-type = <0x73110002>. Mainline
++	 * edt-ft5x06 may bind if the underlying silicon is FT5x06-class.
++	 * Leave disabled until the panel is up. */
 +	touchscreen@38 {
 +		compatible = "edt,edt-ft5x06";
 +		reg = <0x38>;
@@ -314,6 +318,13 @@ index 0000000000000000000000000000000000000000..f9e4149ffc9c5677d112383feb705535
 + *
 + * EVK doesn't expose i2c4 — declare it here from scratch.
 + */
++/* EVK on-board expander at i2c3/0x20. Not populated on the C60 (its
++ * expander is the TCA6408 on i2c4), so the inherited node probes and
++ * logs 'pca953x 2-0020 failed'. Disable it. */
++&pca6416 {
++	status = "disabled";
++};
++
 +&i2c4 {
 +	clock-frequency = <100000>;
 +	pinctrl-names = "default";
@@ -827,7 +838,7 @@ index 0000000000000000000000000000000000000000..f9e4149ffc9c5677d112383feb705535
 +	ports {
 +		#address-cells = <1>;
 +		#size-cells = <0>;
-+		port@0 {
++		sai1_rx_cpu_port: port@0 {
 +			reg = <0>;	/* RX (mic array) */
 +			sai1_rx_cpu_ep: endpoint {
 +				remote-endpoint = <&sai1_rx_multi_ep>;
@@ -903,6 +914,10 @@ index 0000000000000000000000000000000000000000..f9e4149ffc9c5677d112383feb705535
 +	sound-mics {
 +		compatible = "audio-graph-card2";
 +		label = "kepler-mics";
++		/* Speaker-only for now: mic capture (graph-card2 multi) is a
++		 * follow-up. Disable the card so the installed image ships working
++		 * audio playback; the mic codec nodes stay for the mic bring-up. */
++		status = "disabled";
 +
 +		widgets =
 +			"Microphone", "Internal Mic Front-Pair",
@@ -911,7 +926,7 @@ index 0000000000000000000000000000000000000000..f9e4149ffc9c5677d112383feb705535
 +		/* routing left minimal until physical-mic mapping is
 +		 * confirmed. */
 +
-+		links = <&sai1_rx_cpu_ep>;
++		links = <&sai1_rx_cpu_port>;
 +
 +		multi {
 +			#address-cells = <1>;
@@ -968,6 +983,13 @@ index 0000000000000000000000000000000000000000..f9e4149ffc9c5677d112383feb705535
 + *
 + * Each is a follow-up bring-up milestone.
 + */
++
++/* OTG port is device-only in our flow (SDP/fastboot + headless usbnet gadget);
++ * force peripheral so the chipidea controller connects the gadget to the host
++ * instead of waiting on the OTG state machine. */
++&usbotg1 {
++	dr_mode = "peripheral";
++};
 +
 +/* --------------------------------------------------------------------- */
 +/* Bluetooth: BCM4356 / CYW4354A2 combo, HCI over UART1 (ttymxc0).

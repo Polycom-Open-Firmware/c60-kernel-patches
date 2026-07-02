@@ -1,0 +1,282 @@
+From b2c3d4e5f6a70211bcdef0123456789abcdef012 Mon Sep 17 00:00:00 2001
+From: PolyOpenFirmware <alex.camilo@gmail.com>
+Date: Wed, 1 Jul 2026 23:16:00 +0000
+Subject: [PATCH 11/11] Input: digipyro - add Excelitas PYD1588 presence sensor
+
+The Poly Trio C60 uses an Excelitas PYD1588-family "DigiPyro"
+pyroelectric presence (PIR) sensor, bit-banged over two GPIOs and used
+in WAKE-UP mode: a 25-bit configuration word (default 0xC4110) is
+shifted in on the SERIN line, after which the DIRECT-LINK pin is a bare
+motion interrupt (rising edge = motion).
+
+Add a platform+input driver that requests the two GPIOs, maps the
+DIRECT-LINK IRQ, programs the sensor over SERIN, and reports each motion
+event to userspace as an EV_ABS/ABS_MISC value that toggles 0<->1
+(matching the stock "BiometricHumanPresence" consumer). The 40-bit
+Direct-Link ADC read-out protocol is unused by the stock firmware and is
+not implemented. The config word is overridable via the
+"excelitas,config" DT property and a sysfs "config" attribute.
+
+Signed-off-by: Alex Camilo <alex.camilo@gmail.com>
+---
+ drivers/input/misc/Kconfig    |  12 +++
+ drivers/input/misc/Makefile   |   1 +
+ drivers/input/misc/digipyro.c | 214 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 227 insertions(+)
+ create mode 100644 drivers/input/misc/digipyro.c
+
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+index 6ba984d7f..e7c3f3866 100644
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -939,4 +939,16 @@ config INPUT_STPMIC1_ONKEY
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called stpmic1_onkey.
+ 
++config INPUT_DIGIPYRO
++	tristate "Excelitas PYD1588 DigiPyro presence sensor"
++	depends on GPIOLIB || COMPILE_TEST
++	help
++	  Say Y here to enable support for the Excelitas PYD1588-family
++	  "DigiPyro" pyroelectric presence (PIR) sensor, bit-banged over two
++	  GPIOs (SERIN + DIRECT-LINK) and exposed as an input device. Used on
++	  the Poly Trio C60 for human-presence wake-up.
++
++	  To compile this driver as a module, choose M here: the module will
++	  be called digipyro.
++
+ endif
+diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+index 04296a4ab..3a245769b 100644
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -32,6 +32,7 @@ obj-$(CONFIG_INPUT_DA7280_HAPTICS)	+= da7280.o
+ obj-$(CONFIG_INPUT_DA9052_ONKEY)	+= da9052_onkey.o
+ obj-$(CONFIG_INPUT_DA9055_ONKEY)	+= da9055_onkey.o
+ obj-$(CONFIG_INPUT_DA9063_ONKEY)	+= da9063_onkey.o
++obj-$(CONFIG_INPUT_DIGIPYRO)		+= digipyro.o
+ obj-$(CONFIG_INPUT_E3X0_BUTTON)		+= e3x0-button.o
+ obj-$(CONFIG_INPUT_DRV260X_HAPTICS)	+= drv260x.o
+ obj-$(CONFIG_INPUT_DRV2665_HAPTICS)	+= drv2665.o
+diff --git a/drivers/input/misc/digipyro.c b/drivers/input/misc/digipyro.c
+new file mode 100644
+index 000000000..0da186c55
+--- /dev/null
++++ b/drivers/input/misc/digipyro.c
+@@ -0,0 +1,214 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * digipyro.c - Excelitas PYD1588-family "DigiPyro" pyroelectric presence
++ * sensor, bit-banged over two GPIOs and exposed as a Linux input device.
++ *
++ * The Poly Trio C60 wires the sensor's SERIN (serial config) and DIRECT-LINK
++ * (DL) pins to SoC GPIOs.  The sensor is used in WAKE-UP mode only: a 25-bit
++ * configuration word is shifted in on SERIN, after which the DL pin is a bare
++ * motion interrupt (rising edge = motion detected).  The 40-bit Direct-Link
++ * ADC read-out protocol is not used by the stock firmware and is not
++ * implemented here.
++ *
++ * Each motion event is reported to userspace as an EV_ABS/ABS_MISC event whose
++ * value toggles 0<->1, matching the stock "BiometricHumanPresence" consumer.
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/gpio/consumer.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/property.h>
++#include <linux/slab.h>
++
++/* Default 25-bit config word: threshold=6 (very sensitive), blind-time=2,
++ * pulse-counter=1, window=2s, mode=WAKE-UP, source=PIR band-pass, the two
++ * mandatory reserved '10' bits set. */
++#define DIGIPYRO_DEFAULT_CONFIG		0x0C4110
++#define DIGIPYRO_CONFIG_BITS		25
++
++struct digipyro {
++	struct gpio_desc *serin;
++	struct gpio_desc *dl;
++	struct input_dev *input;
++	struct device *dev;
++	u32 config;
++	int state;
++};
++
++/*
++ * Pull DL low for ~150us and release back to input.  Used both to clear the
++ * wake-up latch after a motion interrupt and as the power-on reset pulse.
++ */
++static void digipyro_dl_reset(struct digipyro *dp)
++{
++	gpiod_direction_output(dp->dl, 0);
++	usleep_range(150, 151);
++	gpiod_direction_input(dp->dl);
++}
++
++/*
++ * Shift the 25-bit configuration word into the sensor MSB-first on SERIN.
++ * Per bit: a low->high edge clocks the sensor, then the data bit is presented
++ * and held ~100us.  The word latches on the final >=600us low.
++ */
++static void digipyro_write_config(struct digipyro *dp, u32 cfg)
++{
++	int i;
++
++	gpiod_direction_output(dp->serin, 0);
++
++	for (i = DIGIPYRO_CONFIG_BITS - 1; i >= 0; i--) {
++		gpiod_set_value(dp->serin, 0);
++		gpiod_set_value(dp->serin, 1);
++		gpiod_set_value(dp->serin, (cfg >> i) & 1);
++		udelay(100);
++	}
++
++	gpiod_set_value(dp->serin, 0);
++	udelay(600);
++}
++
++static irqreturn_t digipyro_thread(int irq, void *data)
++{
++	struct digipyro *dp = data;
++
++	/* Clear the wake-up latch so the next motion re-arms the interrupt. */
++	digipyro_dl_reset(dp);
++
++	dp->state = !dp->state;
++	input_event(dp->input, EV_ABS, ABS_MISC, dp->state);
++	input_sync(dp->input);
++
++	return IRQ_HANDLED;
++}
++
++static ssize_t config_show(struct device *dev,
++			   struct device_attribute *attr, char *buf)
++{
++	struct digipyro *dp = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "0x%06x\n", dp->config);
++}
++
++static ssize_t config_store(struct device *dev,
++			    struct device_attribute *attr,
++			    const char *buf, size_t len)
++{
++	struct digipyro *dp = dev_get_drvdata(dev);
++	u32 val;
++	int ret;
++
++	ret = kstrtou32(buf, 0, &val);
++	if (ret)
++		return ret;
++
++	dp->config = val & GENMASK(DIGIPYRO_CONFIG_BITS - 1, 0);
++	digipyro_write_config(dp, dp->config);
++
++	return len;
++}
++static DEVICE_ATTR_RW(config);
++
++static struct attribute *digipyro_attrs[] = {
++	&dev_attr_config.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(digipyro);
++
++static int digipyro_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct digipyro *dp;
++	int irq, ret;
++
++	dp = devm_kzalloc(dev, sizeof(*dp), GFP_KERNEL);
++	if (!dp)
++		return -ENOMEM;
++
++	dp->dev = dev;
++	platform_set_drvdata(pdev, dp);
++	dev_set_drvdata(dev, dp);
++
++	/* 1. Request the two GPIOs. */
++	dp->serin = devm_gpiod_get(dev, "serial-in", GPIOD_OUT_LOW);
++	if (IS_ERR(dp->serin))
++		return dev_err_probe(dev, PTR_ERR(dp->serin),
++				     "failed to get serial-in GPIO\n");
++
++	dp->dl = devm_gpiod_get(dev, "direct-link", GPIOD_IN);
++	if (IS_ERR(dp->dl))
++		return dev_err_probe(dev, PTR_ERR(dp->dl),
++				     "failed to get direct-link GPIO\n");
++
++	/* 2. Power-on reset pulse on DL. */
++	digipyro_dl_reset(dp);
++
++	/* 3. Motion interrupt lives on the DL line. */
++	irq = gpiod_to_irq(dp->dl);
++	if (irq < 0)
++		return dev_err_probe(dev, irq, "failed to map direct-link IRQ\n");
++
++	/* 4. Input device: presence reported as a toggling ABS_MISC value. */
++	dp->input = devm_input_allocate_device(dev);
++	if (!dp->input)
++		return -ENOMEM;
++
++	dp->input->name = "digipyro";
++	dp->input->phys = "digipyro/input0";
++	dp->input->id.bustype = BUS_HOST;
++	dp->input->dev.parent = dev;
++
++	input_set_capability(dp->input, EV_ABS, ABS_MISC);
++	input_set_abs_params(dp->input, ABS_MISC, 0, 255, 0, 1);
++	/* Stock also advertises an (unused) key; mirror it for parity. */
++	input_set_capability(dp->input, EV_KEY, 42);
++
++	ret = input_register_device(dp->input);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to register input\n");
++
++	/* 5. Threaded IRQ: rising edge on DL == motion. ONESHOT keeps the line
++	 * masked while the reset pulse in the handler re-arms the sensor. */
++	ret = devm_request_threaded_irq(dev, irq, NULL, digipyro_thread,
++					IRQF_TRIGGER_RISING | IRQF_ONESHOT,
++					"digipyro", dp);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request IRQ %d\n", irq);
++
++	/* 6. Program the sensor LAST, once everything is armed. */
++	dp->config = DIGIPYRO_DEFAULT_CONFIG;
++	device_property_read_u32(dev, "excelitas,config", &dp->config);
++	dp->config &= GENMASK(DIGIPYRO_CONFIG_BITS - 1, 0);
++	digipyro_write_config(dp, dp->config);
++
++	dev_info(dev, "DigiPyro presence sensor ready (irq %d, config 0x%06x)\n",
++		 irq, dp->config);
++
++	return 0;
++}
++
++static const struct of_device_id digipyro_of_match[] = {
++	{ .compatible = "excelitas,pyd1588" },
++	{ .compatible = "digipyro" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, digipyro_of_match);
++
++static struct platform_driver digipyro_driver = {
++	.driver = {
++		.name		= "digipyro",
++		.of_match_table	= digipyro_of_match,
++		.dev_groups	= digipyro_groups,
++	},
++	.probe = digipyro_probe,
++};
++module_platform_driver(digipyro_driver);
++
++MODULE_DESCRIPTION("Excelitas PYD1588 DigiPyro presence sensor");
++MODULE_AUTHOR("Poly Trio C60 bring-up");
++MODULE_LICENSE("GPL");
+-- 
+2.39.5

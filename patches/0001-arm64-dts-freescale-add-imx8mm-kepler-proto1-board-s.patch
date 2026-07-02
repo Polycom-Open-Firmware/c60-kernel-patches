@@ -1,7 +1,7 @@
 From db4d348ffc7597369c342858faff39c36215adaa Mon Sep 17 00:00:00 2001
 From: PolyOpenFirmware <alex.camilo@gmail.com>
 Date: Wed, 1 Jul 2026 15:32:14 +0000
-Subject: [PATCH 1/9] arm64: dts: freescale: add imx8mm-kepler-proto1 board
+Subject: [PATCH 01/11] arm64: dts: freescale: add imx8mm-kepler-proto1 board
  support
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -13,14 +13,18 @@ the same RTL8363NB-VB DSA switch driver, TAS5751M codec, BD71837 PMIC,
 and FEC fixed-PHY conduit work introduced for the TC8.
 
 Currently enabled: console (ttymxc1), eMMC (USDHC3), FEC + RTL DSA
-switch with lan/pc user ports, BD71837 PMIC, and the full audio card
+switch with lan/pc user ports, BD71837 PMIC, the full audio card
 (poly,c60-audio: TAS5751M speaker playback + 3x TLV320ADC3101 mic-array
-capture on SAI1).
+capture on SAI1), and the I/O subsystems — a gpio-leds "status" LED, the
+three TI LP5569 9-channel LED controllers driving the light-bar /
+mute-ring (i2c2/i2c3/i2c4 @0x32, 27 channels), the extmic-mute gpio-key
+(KEY_MICMUTE), the TCA6408 I2C GPIO expander, and the Excelitas PYD1588
+"DigiPyro" presence sensor.
 
 Stubbed (status = "disabled", board chips physically present but
 mainline driver bring-up not yet done): TC358743 HDMI-in bridge,
-ADV7535 HDMI-out, RM67191 DSI panel, Focaltech FTS touch, LP5569 LEDs,
-IR receiver, brcmfmac WiFi/BT on PCIe.
+ADV7535 HDMI-out, RM67191 DSI panel, Focaltech FTS touch, brcmfmac
+WiFi/BT on PCIe.
 
 Verified booting Debian 12 / 6.6 on a kepler_proto1 unit via Android
 `boota` + AVB orange (testkey signing) — same flash flow as the
@@ -28,9 +32,9 @@ TC8. Slot B Polycom Android remains untouched as recovery.
 
 Signed-off-by: Alex Camilo <alex.camilo@gmail.com>
 ---
- arch/arm64/boot/dts/freescale/Makefile        |   1 +
- .../dts/freescale/imx8mm-kepler-proto1.dts    | 922 ++++++++++++++++++
- 2 files changed, 923 insertions(+)
+ arch/arm64/boot/dts/freescale/Makefile        |    1 +
+ .../dts/freescale/imx8mm-kepler-proto1.dts    | 1024 +++++++++++++++++
+ 2 files changed, 1025 insertions(+)
  create mode 100644 arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
 
 diff --git a/arch/arm64/boot/dts/freescale/Makefile b/arch/arm64/boot/dts/freescale/Makefile
@@ -44,10 +48,10 @@ index 89aee6c92..970bcf1fe 100644
 +dtb-$(CONFIG_ARCH_MXC) += imx8mm-kepler-proto1.dtb
 diff --git a/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
 new file mode 100644
-index 000000000..3dee9c390
+index 000000000..2beabdbe3
 --- /dev/null
 +++ b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
-@@ -0,0 +1,922 @@
+@@ -0,0 +1,1024 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +// Polycom Trio C60 (Kepler proto1) — incremental DT on top of EVK base.
 +//
@@ -63,6 +67,7 @@ index 000000000..3dee9c390
 +
 +#include <dt-bindings/gpio/gpio.h>
 +#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/leds/common.h>
 +#include <dt-bindings/phy/phy-imx8-pcie.h>
 +#include "imx8mm-evk.dtsi"
 +
@@ -129,6 +134,33 @@ index 000000000..3dee9c390
 +			pinctrl-names = "default";
 +			pinctrl-0 = <&pinctrl_micmute>;
 +		};
++	};
++
++	/* Status LED — GPIO3_IO16, active-high, on at boot (stock gpio-leds). */
++	leds {
++		compatible = "gpio-leds";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_gpioled>;
++
++		status {
++			label = "status";
++			gpios = <&gpio3 16 GPIO_ACTIVE_HIGH>;
++			default-state = "on";
++		};
++	};
++
++	/* Excelitas PYD1588 "DigiPyro" presence sensor (WAKE-UP mode).
++	 * SERIN = GPIO1_IO13 (config bit-bang), DIRECT-LINK = GPIO1_IO09
++	 * (motion IRQ). Both pads declared active-high so the driver's
++	 * gpiod_set_value()/direction_output() semantics drive the true
++	 * physical levels. */
++	digipyro: presence-sensor {
++		compatible = "excelitas,pyd1588", "digipyro";
++		pinctrl-names = "default";
++		pinctrl-0 = <&pinctrl_ir_recv>;
++		serial-in-gpios = <&gpio1 13 GPIO_ACTIVE_HIGH>;
++		direct-link-gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;
++		excelitas,config = <0xC4110>;
 +	};
 +};
 +
@@ -215,9 +247,27 @@ index 000000000..3dee9c390
 +	 * chip likely depopulated. */
 +	/* (intentionally omitted) */
 +
-+	/* LP5569 @ 0x32 — chip not populated. Add when a populated rev
-+	 * shows up. */
-+	/* (intentionally omitted) */
++	/* LP5569 9-channel LED controller — light-bar CENTRE segment.
++	 * Internal-clock master: re-drives CLK out to the two EXT side chips
++	 * on i2c3/i2c4 so all three light-bar segments stay phase-locked. */
++	led-controller@32 {
++		compatible = "ti,lp5569";
++		reg = <0x32>;
++		clock-mode = /bits/ 8 <1>;	/* LP55XX_CLOCK_INT */
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++
++		led@0 { reg = <0>; color = <LED_COLOR_ID_RED>;   chan-name = "c_r1"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@1 { reg = <1>; color = <LED_COLOR_ID_GREEN>; chan-name = "c_g1"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@2 { reg = <2>; color = <LED_COLOR_ID_BLUE>;  chan-name = "c_b1"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@3 { reg = <3>; color = <LED_COLOR_ID_RED>;   chan-name = "c_r2"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@4 { reg = <4>; color = <LED_COLOR_ID_GREEN>; chan-name = "c_g2"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@5 { reg = <5>; color = <LED_COLOR_ID_BLUE>;  chan-name = "c_b2"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@6 { reg = <6>; color = <LED_COLOR_ID_RED>;   chan-name = "c_r3"; led-cur = /bits/ 8 <0x96>; max-cur = /bits/ 8 <0xff>; };
++		led@7 { reg = <7>; color = <LED_COLOR_ID_GREEN>; chan-name = "c_g3"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@8 { reg = <8>; color = <LED_COLOR_ID_BLUE>;  chan-name = "c_b3"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++	};
 +};
 +
 +/* --------------------------------------------------------------------- */
@@ -307,6 +357,27 @@ index 000000000..3dee9c390
 +		sound-name-prefix = "Mic2";
 +		status = "okay";
 +	};
++
++	/* LP5569 9-channel LED controller — light-bar LEFT segment.
++	 * External clock (fed from the centre chip's CLK output). */
++	led-controller@32 {
++		compatible = "ti,lp5569";
++		reg = <0x32>;
++		clock-mode = /bits/ 8 <2>;	/* LP55XX_CLOCK_EXT */
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++
++		led@0 { reg = <0>; color = <LED_COLOR_ID_RED>;   chan-name = "l_r1"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@1 { reg = <1>; color = <LED_COLOR_ID_GREEN>; chan-name = "l_g1"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@2 { reg = <2>; color = <LED_COLOR_ID_BLUE>;  chan-name = "l_b1"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@3 { reg = <3>; color = <LED_COLOR_ID_RED>;   chan-name = "l_r2"; led-cur = /bits/ 8 <0x96>; max-cur = /bits/ 8 <0xff>; };
++		led@4 { reg = <4>; color = <LED_COLOR_ID_GREEN>; chan-name = "l_g2"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@5 { reg = <5>; color = <LED_COLOR_ID_BLUE>;  chan-name = "l_b2"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@6 { reg = <6>; color = <LED_COLOR_ID_RED>;   chan-name = "l_r3"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@7 { reg = <7>; color = <LED_COLOR_ID_GREEN>; chan-name = "l_g3"; led-cur = /bits/ 8 <0x7d>; max-cur = /bits/ 8 <0xff>; };
++		led@8 { reg = <8>; color = <LED_COLOR_ID_BLUE>;  chan-name = "l_b3"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++	};
 +};
 +
 +/* --------------------------------------------------------------------- */
@@ -364,6 +435,27 @@ index 000000000..3dee9c390
 +				clock-noncontinuous;
 +			};
 +		};
++	};
++
++	/* LP5569 9-channel LED controller — light-bar RIGHT segment.
++	 * External clock (fed from the centre chip's CLK output). */
++	led-controller@32 {
++		compatible = "ti,lp5569";
++		reg = <0x32>;
++		clock-mode = /bits/ 8 <2>;	/* LP55XX_CLOCK_EXT */
++		#address-cells = <1>;
++		#size-cells = <0>;
++		status = "okay";
++
++		led@0 { reg = <0>; color = <LED_COLOR_ID_RED>;   chan-name = "r_r1"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@1 { reg = <1>; color = <LED_COLOR_ID_GREEN>; chan-name = "r_g1"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@2 { reg = <2>; color = <LED_COLOR_ID_BLUE>;  chan-name = "r_b1"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@3 { reg = <3>; color = <LED_COLOR_ID_RED>;   chan-name = "r_r2"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@4 { reg = <4>; color = <LED_COLOR_ID_GREEN>; chan-name = "r_g2"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@5 { reg = <5>; color = <LED_COLOR_ID_BLUE>;  chan-name = "r_b2"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@6 { reg = <6>; color = <LED_COLOR_ID_RED>;   chan-name = "r_r3"; led-cur = /bits/ 8 <0x96>; max-cur = /bits/ 8 <0xff>; };
++		led@7 { reg = <7>; color = <LED_COLOR_ID_GREEN>; chan-name = "r_g3"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
++		led@8 { reg = <8>; color = <LED_COLOR_ID_BLUE>;  chan-name = "r_b3"; led-cur = /bits/ 8 <0xaf>; max-cur = /bits/ 8 <0xff>; };
 +	};
 +};
 +
@@ -496,6 +588,20 @@ index 000000000..3dee9c390
 +/* IO mux groups carried from stock c60.dts. Pin offset values are handed
 + * off to the SoC verbatim by pinctrl-imx. */
 +&iomuxc {
++	/* Status LED — NAND_READY_B pad as GPIO3_IO16, mode 5, pad-ctl 0x19. */
++	pinctrl_gpioled: gpioledgrp {
++		fsl,pins = <0x134 0x39c 0x000 0x05 0x000 0x19>;
++	};
++
++	/* DigiPyro: SERIN = GPIO1_IO13 (pad-ctl 0x14f), DIRECT-LINK =
++	 * GPIO1_IO09 (pad-ctl 0x01). Verbatim from the stock ir_recv group. */
++	pinctrl_ir_recv: irrecvgrp {
++		fsl,pins = <
++			0x5c 0x2c4 0x000 0x00 0x000 0x14f
++			0x4c 0x2b4 0x000 0x00 0x000 0x01
++		>;
++	};
++
 +	pinctrl_focaltech: focaltechgrp {
 +		fsl,pins = <
 +			0xac 0x314 0x000 0x05 0x000 0x1d0
@@ -970,3 +1076,5 @@ index 000000000..3dee9c390
 +		>;
 +	};
 +};
+-- 
+2.39.5

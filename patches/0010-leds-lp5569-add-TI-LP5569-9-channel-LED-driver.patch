@@ -1,0 +1,348 @@
+From a1b2c3d4e5f60110abcdef0123456789abcdef01 Mon Sep 17 00:00:00 2001
+From: PolyOpenFirmware <alex.camilo@gmail.com>
+Date: Wed, 1 Jul 2026 23:15:00 +0000
+Subject: [PATCH 10/11] leds: lp5569: add TI LP5569 9-channel LED driver
+
+The Poly Trio C60 light-bar / mute-ring is driven by three TI LP5569
+9-channel programmable LED controllers (i2c2/i2c3/i2c4 @0x32). Mainline
+gained a dedicated leds-lp5569.c only after v6.6, and that driver relies
+on the later register-in-device_config refactor of leds-lp55xx-common,
+so it does not build against this tree.
+
+Add an LP5569 sub-driver written against the v6.6 leds-lp55xx-common
+API (modelled on leds-lp5523.c) implementing the direct per-channel
+I2C/PWM brightness path — enough to expose all 27 channels as LED class
+devices for userspace control. The register map and power-on/clock init
+sequence follow the upstream driver: MISC (0x2F) charge-pump + power-save
+config, internal-clock master re-driving CLK to the two external-clock
+side controllers, CHIP_EN, startup-busy poll, then OP_MODE=0 for direct
+PWM. The pattern engines are intentionally left out.
+
+Signed-off-by: Alex Camilo <alex.camilo@gmail.com>
+---
+ drivers/leds/Kconfig       |  10 ++
+ drivers/leds/Makefile      |   1 +
+ drivers/leds/leds-lp5569.c | 279 +++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 290 insertions(+)
+ create mode 100644 drivers/leds/leds-lp5569.c
+
+diff --git a/drivers/leds/Kconfig b/drivers/leds/Kconfig
+index b92208ecc..0ec16459d 100644
+--- a/drivers/leds/Kconfig
++++ b/drivers/leds/Kconfig
+@@ -443,6 +443,16 @@ config LEDS_LP8501
+ 	  It is similar as LP5523, but output power selection is available.
+ 	  And register layout and engine program schemes are different.
+ 
++config LEDS_LP5569
++	tristate "LED Support for TI LP5569 LED driver chip"
++	depends on LEDS_CLASS && I2C
++	depends on LEDS_LP55XX_COMMON
++	help
++	  If you say yes here you get support for the TI LP5569 LED driver.
++	  It is a 9 channel chip with programmable engines. This driver
++	  provides direct per-channel PWM control via the LED class; the
++	  Poly Trio C60 light-bar / mute-ring uses three of these.
++
+ config LEDS_LP8788
+ 	tristate "LED support for the TI LP8788 PMIC"
+ 	depends on LEDS_CLASS
+diff --git a/drivers/leds/Makefile b/drivers/leds/Makefile
+index d7348e8bc..b9376afa7 100644
+--- a/drivers/leds/Makefile
++++ b/drivers/leds/Makefile
+@@ -51,6 +51,7 @@ obj-$(CONFIG_LEDS_LP50XX)		+= leds-lp50xx.o
+ obj-$(CONFIG_LEDS_LP5521)		+= leds-lp5521.o
+ obj-$(CONFIG_LEDS_LP5523)		+= leds-lp5523.o
+ obj-$(CONFIG_LEDS_LP5562)		+= leds-lp5562.o
++obj-$(CONFIG_LEDS_LP5569)		+= leds-lp5569.o
+ obj-$(CONFIG_LEDS_LP55XX_COMMON)	+= leds-lp55xx-common.o
+ obj-$(CONFIG_LEDS_LP8501)		+= leds-lp8501.o
+ obj-$(CONFIG_LEDS_LP8788)		+= leds-lp8788.o
+diff --git a/drivers/leds/leds-lp5569.c b/drivers/leds/leds-lp5569.c
+new file mode 100644
+index 000000000..314370a9a
+--- /dev/null
++++ b/drivers/leds/leds-lp5569.c
+@@ -0,0 +1,279 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * leds-lp5569.c - TI/National LP5569 9-channel LED driver
++ *
++ * Backport of the mainline LP5569 support to the v6.6 leds-lp55xx-common
++ * framework (which predates the register-in-device_config refactor). Only
++ * the direct I2C/PWM brightness path is implemented — the mute-ring /
++ * light-bar on the Poly Trio C60 is driven per-channel from userspace, so
++ * the pattern engines are intentionally left out.
++ *
++ * Register map and init sequence follow the upstream drivers/leds/leds-lp5569.c
++ * (Christian Marangi). Copyright (C) 2024. Ported for the C60 bring-up.
++ */
++
++#include <linux/delay.h>
++#include <linux/i2c.h>
++#include <linux/leds.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/platform_data/leds-lp55xx.h>
++#include <linux/slab.h>
++
++#include "leds-lp55xx-common.h"
++
++#define LP5569_MAX_LEDS			9
++
++/* Registers */
++#define LP5569_REG_ENABLE		0x00
++#define LP5569_REG_EXEC_CTRL		0x01
++#define LP5569_REG_OP_MODE		0x02
++#define LP5569_REG_ENABLE_LEDS_MSB	0x04
++#define LP5569_REG_ENABLE_LEDS_LSB	0x05
++#define LP5569_REG_LED_CTRL_BASE	0x07
++#define LP5569_REG_LED_PWM_BASE		0x16
++#define LP5569_REG_LED_CURRENT_BASE	0x22
++#define LP5569_REG_MISC			0x2F
++#define LP5569_REG_MISC2		0x33
++#define LP5569_REG_STATUS		0x3C
++#define LP5569_REG_IO_CONTROL		0x3D
++#define LP5569_REG_RESET		0x3F
++#define LP5569_REG_MASTER_FADER_BASE	0x46
++
++/* MISC (0x2F) bits */
++#define LP5569_AUTO_INC			0x40	/* BIT(6) */
++#define LP5569_PWR_SAVE			0x20	/* BIT(5) */
++#define LP5569_CP_MODE_MASK		0x18	/* GENMASK(4, 3) */
++#define LP5569_CP_MODE_SHIFT		3
++#define LP5569_PWM_PWR_SAVE		0x04	/* BIT(2) */
++#define LP5569_INTERNAL_CLK		0x01	/* BIT(0) */
++
++#define LP5569_DEFAULT_CONFIG \
++	(LP5569_AUTO_INC | LP5569_PWR_SAVE | LP5569_PWM_PWR_SAVE)
++
++/* STATUS (0x3C) bits */
++#define LP5569_STARTUP_BUSY		0x40	/* BIT(6) */
++
++/* IO_CONTROL (0x3D) bits */
++#define LP5569_CLK_OUTPUT		0x08	/* BIT(3) */
++
++/* ENABLE (0x00) / RESET (0x3F) values */
++#define LP5569_ENABLE			0x40	/* BIT(6), CHIP_EN */
++#define LP5569_RESET			0xFF
++
++#define LP5569_STARTUP_SLEEP		500
++
++enum lp5569_chip_id {
++	LP5569,
++};
++
++static void lp5569_set_led_current(struct lp55xx_led *led, u8 led_current)
++{
++	led->led_current = led_current;
++	lp55xx_write(led->chip, LP5569_REG_LED_CURRENT_BASE + led->chan_nr,
++		     led_current);
++}
++
++static int lp5569_post_init_device(struct lp55xx_chip *chip)
++{
++	int ret;
++	int i;
++	u8 val;
++
++	/* Charge-pump + power-save configuration (MISC) */
++	val = LP5569_DEFAULT_CONFIG;
++	val |= (chip->pdata->charge_pump_mode << LP5569_CP_MODE_SHIFT) &
++	       LP5569_CP_MODE_MASK;
++	ret = lp55xx_write(chip, LP5569_REG_MISC, val);
++	if (ret)
++		return ret;
++
++	/*
++	 * Clock configuration.  On the C60 light-bar the centre controller
++	 * runs on its internal oscillator and re-drives it out of CLK so the
++	 * two side controllers (clock-mode = EXT) stay phase-locked.  Internal
++	 * clock MUST be selected before enabling the CLK output.
++	 */
++	if (chip->pdata->clock_mode == LP55XX_CLOCK_INT) {
++		ret = lp55xx_update_bits(chip, LP5569_REG_MISC,
++					 LP5569_INTERNAL_CLK,
++					 LP5569_INTERNAL_CLK);
++		if (ret)
++			return ret;
++
++		ret = lp55xx_update_bits(chip, LP5569_REG_IO_CONTROL,
++					 LP5569_CLK_OUTPUT,
++					 LP5569_CLK_OUTPUT);
++		if (ret)
++			return ret;
++	}
++
++	/* Power the chip on (CHIP_EN) */
++	ret = lp55xx_write(chip, LP5569_REG_ENABLE, LP5569_ENABLE);
++	if (ret)
++		return ret;
++
++	/* Wait for the startup-busy bit to clear (~500us typical) */
++	for (i = 0; i < 10; i++) {
++		usleep_range(LP5569_STARTUP_SLEEP, LP5569_STARTUP_SLEEP * 2);
++		ret = lp55xx_read(chip, LP5569_REG_STATUS, &val);
++		if (ret)
++			return ret;
++		if (!(val & LP5569_STARTUP_BUSY))
++			break;
++	}
++
++	/*
++	 * Direct PWM control: keep all pattern engines disabled (OP_MODE = 0)
++	 * so the per-channel PWM registers drive the outputs straight from I2C.
++	 */
++	return lp55xx_write(chip, LP5569_REG_OP_MODE, 0);
++}
++
++static int lp5569_multicolor_brightness(struct lp55xx_led *led)
++{
++	struct lp55xx_chip *chip = led->chip;
++	int ret;
++	int i;
++
++	mutex_lock(&chip->lock);
++	for (i = 0; i < led->mc_cdev.num_colors; i++) {
++		ret = lp55xx_write(chip,
++				   LP5569_REG_LED_PWM_BASE +
++				   led->mc_cdev.subled_info[i].channel,
++				   led->mc_cdev.subled_info[i].brightness);
++		if (ret)
++			break;
++	}
++	mutex_unlock(&chip->lock);
++	return ret;
++}
++
++static int lp5569_led_brightness(struct lp55xx_led *led)
++{
++	struct lp55xx_chip *chip = led->chip;
++	int ret;
++
++	mutex_lock(&chip->lock);
++	ret = lp55xx_write(chip, LP5569_REG_LED_PWM_BASE + led->chan_nr,
++			   led->brightness);
++	mutex_unlock(&chip->lock);
++	return ret;
++}
++
++/* Chip specific configuration */
++static struct lp55xx_device_config lp5569_cfg = {
++	.reset = {
++		.addr = LP5569_REG_RESET,
++		.val  = LP5569_RESET,
++	},
++	.enable = {
++		.addr = LP5569_REG_ENABLE,
++		.val  = LP5569_ENABLE,
++	},
++	.max_channel			= LP5569_MAX_LEDS,
++	.post_init_device		= lp5569_post_init_device,
++	.brightness_fn			= lp5569_led_brightness,
++	.multicolor_brightness_fn	= lp5569_multicolor_brightness,
++	.set_led_current		= lp5569_set_led_current,
++	/* run_engine / firmware_cb intentionally NULL: direct PWM only */
++};
++
++static int lp5569_probe(struct i2c_client *client)
++{
++	const struct i2c_device_id *id = i2c_client_get_device_id(client);
++	int ret;
++	struct lp55xx_chip *chip;
++	struct lp55xx_led *led;
++	struct lp55xx_platform_data *pdata = dev_get_platdata(&client->dev);
++	struct device_node *np = dev_of_node(&client->dev);
++
++	chip = devm_kzalloc(&client->dev, sizeof(*chip), GFP_KERNEL);
++	if (!chip)
++		return -ENOMEM;
++
++	chip->cfg = &lp5569_cfg;
++
++	if (!pdata) {
++		if (np) {
++			pdata = lp55xx_of_populate_pdata(&client->dev, np, chip);
++			if (IS_ERR(pdata))
++				return PTR_ERR(pdata);
++		} else {
++			dev_err(&client->dev, "no platform data\n");
++			return -EINVAL;
++		}
++	}
++
++	led = devm_kcalloc(&client->dev,
++			   pdata->num_channels, sizeof(*led), GFP_KERNEL);
++	if (!led)
++		return -ENOMEM;
++
++	chip->cl = client;
++	chip->pdata = pdata;
++
++	mutex_init(&chip->lock);
++
++	i2c_set_clientdata(client, led);
++
++	ret = lp55xx_init_device(chip);
++	if (ret)
++		goto err_init;
++
++	dev_info(&client->dev, "%s Programmable led chip found\n", id->name);
++
++	ret = lp55xx_register_leds(led, chip);
++	if (ret)
++		goto err_out;
++
++	ret = lp55xx_register_sysfs(chip);
++	if (ret) {
++		dev_err(&client->dev, "registering sysfs failed\n");
++		goto err_out;
++	}
++
++	return 0;
++
++err_out:
++	lp55xx_deinit_device(chip);
++err_init:
++	return ret;
++}
++
++static void lp5569_remove(struct i2c_client *client)
++{
++	struct lp55xx_led *led = i2c_get_clientdata(client);
++	struct lp55xx_chip *chip = led->chip;
++
++	lp55xx_unregister_sysfs(chip);
++	lp55xx_deinit_device(chip);
++}
++
++static const struct i2c_device_id lp5569_id[] = {
++	{ "lp5569", LP5569 },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, lp5569_id);
++
++static const struct of_device_id of_lp5569_leds_match[] = {
++	{ .compatible = "ti,lp5569", },
++	{},
++};
++MODULE_DEVICE_TABLE(of, of_lp5569_leds_match);
++
++static struct i2c_driver lp5569_driver = {
++	.driver = {
++		.name		= "lp5569x",
++		.of_match_table = of_lp5569_leds_match,
++	},
++	.probe		= lp5569_probe,
++	.remove		= lp5569_remove,
++	.id_table	= lp5569_id,
++};
++module_i2c_driver(lp5569_driver);
++
++MODULE_DESCRIPTION("LP5569 LED engine");
++MODULE_AUTHOR("Poly Trio C60 bring-up");
++MODULE_LICENSE("GPL");
+-- 
+2.39.5

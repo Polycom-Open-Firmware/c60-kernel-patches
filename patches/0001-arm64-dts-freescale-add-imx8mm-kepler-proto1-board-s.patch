@@ -33,8 +33,8 @@ TC8. Slot B Polycom Android remains untouched as recovery.
 Signed-off-by: Alex Camilo <alex.camilo@gmail.com>
 ---
  arch/arm64/boot/dts/freescale/Makefile        |    1 +
- .../dts/freescale/imx8mm-kepler-proto1.dts    | 1024 +++++++++++++++++
- 2 files changed, 1025 insertions(+)
+ .../dts/freescale/imx8mm-kepler-proto1.dts    | 1039 +++++++++++++++++
+ 2 files changed, 1040 insertions(+)
  create mode 100644 arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
 
 diff --git a/arch/arm64/boot/dts/freescale/Makefile b/arch/arm64/boot/dts/freescale/Makefile
@@ -48,10 +48,10 @@ index 89aee6c92..970bcf1fe 100644
 +dtb-$(CONFIG_ARCH_MXC) += imx8mm-kepler-proto1.dtb
 diff --git a/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
 new file mode 100644
-index 000000000..2beabdbe3
+index 000000000..d1d1121d150bfebc89171459757fa7156a1f3400
 --- /dev/null
 +++ b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
-@@ -0,0 +1,1024 @@
+@@ -0,0 +1,1039 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +// Polycom Trio C60 (Kepler proto1) — incremental DT on top of EVK base.
 +//
@@ -281,6 +281,13 @@ index 000000000..2beabdbe3
 +	clock-frequency = <100000>;	/* stock = 0x186a0 = 100 kHz */
 +	status = "okay";
 +
++	/* The imx8mm-evk base dtsi puts an on-board OV5640 camera here,
++	 * wired into the MIPI-CSIS sink (port@0) and — critically — sharing
++	 * reset-gpios = <&gpio1 6> with the C60's TC358743 HDMI-RX bridge.
++	 * The C60 has no OV5640; delete it so the TC358743 owns both the
++	 * CSIS sink endpoint and the gpio1_6 reset line. */
++	/delete-node/ camera@3c;
++
 +	tas5751: audio-codec@2b {
 +		/* Mainline tas571x driver matches "ti,tas5751" (no M-suffix). The
 +		 * TC8 patch 0005 adds tas5751_chip; same silicon family on C60.
@@ -425,8 +432,7 @@ index 000000000..2beabdbe3
 +		pinctrl-0 = <&pinctrl_tc358743>;
 +		status = "okay";
 +
-+		port@0 {
-+			reg = <0>;
++		port {
 +			tc358743_to_mipi_csi: endpoint {
 +				clock-lanes = <0>;
 +				data-lanes = <1 2 3 4>;
@@ -459,16 +465,25 @@ index 000000000..2beabdbe3
 +	};
 +};
 +
-+/* MIPI-CSI in: stock wires tc358743 → mipi_csi@32e30000. EVK leaves CSI
-+ * disabled — turn it on for the HDMI capture path. */
++/* MIPI-CSI in: the C60 feeds the TC358743 HDMI-RX bridge into the CSIS
++ * sink. The imx8mm-evk base dtsi already sets &mipi_csi/&csi status=okay
++ * and pre-wires the CSIS sink (ports/port@0) to its OV5640 and the CSIS
++ * source (ports/port@1) to the CSI bridge (csi_in). Here we retarget the
++ * sink endpoint at the TC358743 (the OV5640 is deleted above) and widen
++ * it to the bridge's four CSI-2 data lanes; the source→CSI link is
++ * inherited unchanged. The CSIS driver takes its sink from port@0
++ * (fwnode_graph_get_endpoint_by_id(dev, 0, 0, ...)). */
 +&mipi_csi {
 +	status = "okay";
 +
-+	port@1 {
-+		reg = <1>;
-+		mipi_csi_from_tc358743: endpoint {
-+			data-lanes = <1 2 3 4>;
-+			remote-endpoint = <&tc358743_to_mipi_csi>;
++	ports {
++		port@0 {
++			reg = <0>;
++			mipi_csi_from_tc358743: endpoint {
++				clock-lanes = <0>;
++				data-lanes = <1 2 3 4>;
++				remote-endpoint = <&tc358743_to_mipi_csi>;
++			};
 +		};
 +	};
 +};
@@ -1076,5 +1091,3 @@ index 000000000..2beabdbe3
 +		>;
 +	};
 +};
--- 
-2.39.5

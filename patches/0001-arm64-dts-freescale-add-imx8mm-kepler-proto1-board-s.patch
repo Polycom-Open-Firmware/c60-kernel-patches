@@ -23,19 +23,29 @@ mute-ring (i2c2/i2c3/i2c4 @0x32, 27 channels), the extmic-mute gpio-key
 
 Stubbed (status = "disabled", board chips physically present but
 mainline driver bring-up not yet done): TC358743 HDMI-in bridge,
-ADV7535 HDMI-out, RM67191 DSI panel, Focaltech FTS touch, brcmfmac
+ADV7535 HDMI-out, Focaltech FTS touch, brcmfmac
 WiFi/BT on PCIe.
 
 Verified booting Debian 12 / 6.6 on a kepler_proto1 unit via Android
 `boota` + AVB orange (testkey signing) — same flash flow as the
 TC8. Slot B Polycom Android remains untouched as recovery.
 
+The RM67191-class panel is a 720x1280 LCD (not the 1080p AMOLED the
+upstream driver assumed). It is brought up end to end: LCDIF (mxsfb, via
+the imx6sx-lcdif fallback) -> Samsung DSIM (fsl,imx8mm-mipi-dsim, integrated
+D-PHY, non-burst sync-pulse) -> rm67191 panel@0, at 720x1280. A gpio2_4
+regulator-fixed models the stock panel-power enable and feeds the driver
+v3p3/v1p8 supplies; reset is gpio2_5 (active low). The LED backlight is on
+PWM4 (stock, 10 kHz); its output pad is SAI3_MCLK, so the unused EVK sai3
+(C60 audio is on SAI1) is disabled to free the pad, and the inherited EVK
+PWM1 backlight is disabled. The 720x1280 mode and the stock panel init
+sequence live in a companion drm/panel patch.
+
 Signed-off-by: Alex Camilo <alex.camilo@gmail.com>
 ---
- arch/arm64/boot/dts/freescale/Makefile        |    1 +
- .../dts/freescale/imx8mm-kepler-proto1.dts    | 1039 +++++++++++++++++
- 2 files changed, 1040 insertions(+)
- create mode 100644 arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
+ arch/arm64/boot/dts/freescale/Makefile             |    1 +
+ .../boot/dts/freescale/imx8mm-kepler-proto1.dts    | 1111 ++++++++++++++++++++
+ 2 files changed, 1112 insertions(+)
 
 diff --git a/arch/arm64/boot/dts/freescale/Makefile b/arch/arm64/boot/dts/freescale/Makefile
 index 89aee6c92..970bcf1fe 100644
@@ -48,10 +58,10 @@ index 89aee6c92..970bcf1fe 100644
 +dtb-$(CONFIG_ARCH_MXC) += imx8mm-kepler-proto1.dtb
 diff --git a/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
 new file mode 100644
-index 000000000..d1d1121d150bfebc89171459757fa7156a1f3400
+index 000000000..56174aea3
 --- /dev/null
 +++ b/arch/arm64/boot/dts/freescale/imx8mm-kepler-proto1.dts
-@@ -0,0 +1,1039 @@
+@@ -0,0 +1,1111 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +// Polycom Trio C60 (Kepler proto1) — incremental DT on top of EVK base.
 +//
@@ -108,6 +118,23 @@ index 000000000..d1d1121d150bfebc89171459757fa7156a1f3400
 +		regulator-min-microvolt = <3300000>;
 +		regulator-max-microvolt = <3300000>;
 +		regulator-always-on;
++	};
++
++	/* RM67191 panel power/enable. Stock drives the panel's power enable out
++	 * of GPIO2_IO04 (the stock DT's "enable-gpio"). The mainline rm67191
++	 * driver has no enable-gpio; instead it does a regulator_bulk_enable on
++	 * its v3p3/v1p8 supplies during .prepare(). Model the enable line as a
++	 * fixed regulator and hand it to the panel as both supplies so the panel
++	 * is powered on prepare and off on unprepare, with correct sequencing
++	 * (power -> reset deassert). Pin is muxed by pinctrl_mipi_dsi_en (shared
++	 * with the reset line) applied on panel@0. */
++	reg_panel_pwr: regulator-panel-pwr {
++		compatible = "regulator-fixed";
++		regulator-name = "panel-power";
++		gpio = <&gpio2 4 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
 +	};
 +
 +	/* Fixed 27 MHz oscillator feeding the TC358743 refclk. Stock named it
@@ -568,11 +595,21 @@ index 000000000..d1d1121d150bfebc89171459757fa7156a1f3400
 +&usdhc1 { status = "disabled"; };
 +
 +/* --------------------------------------------------------------------- */
-+/* MIPI-DSI panel — Raydium RM67191 (C60-specific; mainline already has
-+ * the driver).
++/* MIPI-DSI display — Raydium RM67191 720x1280 AMOLED (C60 Kepler variant).
 + *
-+ * Stock proto1 fails to probe (vendor ID returns 0x00). Try once on
-+ * mainline; if it still fails, fall back to HDMI-in.
++ * Pipeline (all mainline, imx8mm.dtsi pre-wires the LCDIF<->DSIM OF-graph):
++ *   &lcdif (fsl,imx8mm-lcdif -> drm/mxsfb via imx6sx-lcdif fallback)
++ *     -> &mipi_dsi (fsl,imx8mm-mipi-dsim -> drm/bridge/samsung-dsim,
++ *        DSIM_TYPE_IMX8MM; uses its INTEGRATED D-PHY -- there is NO separate
++ *        Mixel DPHY node/driver for i.MX8MM, and adding one would leave the
++ *        DSIM's optional "dsim" phy_get pending forever, so we add none)
++ *     -> panel@0 rm67191 (VC0, DSI child; driver patched for 720x1280).
++ *
++ * The C60 panel has a real LED backlight on PWM4 (stock "lvds_backlight",
++ * 10 kHz), separate from the RM67191 controller's own DCS brightness. It
++ * must be driven for anything to be visible, so re-point the EVK backlight
++ * node to PWM4 and enable it (see &backlight/&pwm4 below). The EVK's PWM1
++ * backlight is not wired on the C60 and is disabled.
 + */
 +&mipi_dsi {
 +	status = "okay";
@@ -580,21 +617,61 @@ index 000000000..d1d1121d150bfebc89171459757fa7156a1f3400
 +	#address-cells = <1>;
 +	#size-cells = <0>;
 +
++	/* samsung-dsim on i.MX8MM needs esc-clock in DT (divisor, must be != 0);
++	 * pll-clock-frequency (24 MHz) is inherited from imx8mm.dtsi. No
++	 * burst-clock: the panel runs non-burst sync-pulse, so the driver derives
++	 * the HS bit clock from the pixel clock (79.61e6 * 24bpp / 4 lanes =
++	 * 477.66 Mbps/lane); a higher burst rate would distort the non-burst
++	 * horizontal timing. */
++	samsung,esc-clock-frequency = <20000000>;
++
 +	panel@0 {
 +		compatible = "raydium,rm67191";
 +		reg = <0>;
-+		reset-gpio = <&gpio2 5 GPIO_ACTIVE_LOW>;
++		/* XRES active-low: driver settles reset at logical 0 = physically
++		 * HIGH = run (confirmed on the bench: panel comes out of reset). */
++		reset-gpios = <&gpio2 5 GPIO_ACTIVE_LOW>;
 +		dsi-lanes = <4>;
++		/* gpio2_4 panel-power enable, driven via the fixed regulator */
++		v3p3-supply = <&reg_panel_pwr>;
++		v1p8-supply = <&reg_panel_pwr>;
 +		pinctrl-names = "default";
 +		pinctrl-0 = <&pinctrl_mipi_dsi_en>;
-+		/* power-supply / backlight wiring TODO once panel actually
-+		 * answers DSI commands */
-+		status = "disabled";  /* enable when bring-up is ready */
++		status = "okay";
 +	};
 +};
 +
 +&lcdif {
 +	status = "okay";
++};
++
++/* Panel LED backlight: stock drives it from PWM4 (100 us / 10 kHz period).
++ * Re-point the inherited EVK pwm-backlight node from PWM1 to PWM4; it comes
++ * up enabled at its default level so the backlight lights independently of
++ * the DSI/DRM state (lets us confirm the panel is powered before chasing
++ * pixels). */
++&backlight {
++	pwms = <&pwm4 0 100000 0>;
++	status = "okay";
++};
++
++&pwm4 {
++	pinctrl-names = "default";
++	pinctrl-0 = <&pinctrl_pwm4>;
++	status = "okay";
++};
++
++/* PWM1 is the EVK's backlight PWM; not wired on the C60. */
++&pwm1 {
++	status = "disabled";
++};
++
++/* The PWM4 output pad is SAI3_MCLK. The EVK base leaves &sai3 enabled (for
++ * its wm8524 codec, whose sound card we already disable above), and SAI3
++ * grabs SAI3_MCLK, blocking PWM4. C60 audio is entirely on SAI1, so disable
++ * the unused SAI3 controller to release the pad for the backlight PWM. */
++&sai3 {
++	status = "disabled";
 +};
 +
 +/* No HDMI-out on C60 proto1 — ADV7535 bridge depopulated. */
@@ -666,6 +743,11 @@ index 000000000..d1d1121d150bfebc89171459757fa7156a1f3400
 +			0xb0 0x318 0x000 0x05 0x000 0x16
 +			0xb4 0x31c 0x000 0x05 0x000 0x16
 +		>;
++	};
++
++	/* PWM4 output -> panel LED backlight (stock pwm4grp, ALT1). */
++	pinctrl_pwm4: pwm4grp {
++		fsl,pins = <0x1e4 0x44c 0x000 0x01 0x000 0xd6>;
 +	};
 +
 +	pinctrl_wlan: wlangrp {
@@ -1091,3 +1173,6 @@ index 000000000..d1d1121d150bfebc89171459757fa7156a1f3400
 +		>;
 +	};
 +};
+-- 
+2.43.0
+

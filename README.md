@@ -1,5 +1,10 @@
 # c60-kernel-patches
 
+> **Superseded.** The C60 series now lives in the converged
+> [poly-kernel-patches](https://github.com/Polycom-Open-Firmware/poly-kernel-patches)
+> as `patches/c60/`, consumed by `poly-firmware-build --target=c60`. This
+> repo is kept as the C60 bring-up reference.
+
 Mainline Linux 6.6 patches for the Poly Trio C60 video conferencing
 phone (i.MX 8M Mini, codename **Kepler proto1**). Enables CPU, eMMC,
 networking (RTL8363NB-VB DSA switch on a FEC fixed-PHY conduit), audio,
@@ -8,7 +13,7 @@ and console on a vanilla upstream tree.
 The series is self-contained: it carries the C60 board device tree and
 every out-of-tree driver that DT binds. The shared i.MX 8M Mini
 peripheral drivers (RTL8363NB-VB DSA, FEC fixed-PHY conduit, TAS5751M
-codec) also serve the sister TC8 panel (`tc8-kernel-patches`), whose
+codec) also serve the sister TC8 panel (`poly-kernel-patches`, `patches/tc8/`), whose
 series layout this one mirrors; the C60-specific bits are the
 `imx8mm-kepler-proto1` DTS and its Makefile registration, plus
 tlv320adc3xxx secondary-codec support for the C60's multi-mic TDM
